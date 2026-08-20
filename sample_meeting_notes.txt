@@ -1,0 +1,23 @@
+Notes from product sync - Aug 18
+
+Priya (PM), Rahul (Eng lead), me, Sarah from support joined late
+
+Talked about the returns flow again. Sarah says support tickets 
+for "where's my refund" are still like 30% of volume. Rahul thinks 
+it's because status updates aren't pushed to the customer, they 
+only see it if they check the app manually. 
+
+Priya wants a notification when refund status changes - email at 
+least, maybe push notif later but let's not scope that in for v1. 
+Also she mentioned refunds taking >5 days need an escalation flag 
+for the ops team, not sure if that's this project or separate.
+
+Rahul flagged that the refund status data lives in two systems 
+right now (old payments DB and new one) so there's some duplication 
+work needed - probably worth a spike first.
+
+Didn't get to talking about who owns the QA for this before the 
+call ended, need to follow up with Priya.
+
+Sarah also asked if we could show refund status directly in the 
+support agent tool, separate ask, parking for later.

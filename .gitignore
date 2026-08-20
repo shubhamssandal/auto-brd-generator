@@ -1,0 +1,18 @@
+# Environment variables and secrets
+.env
+
+# Virtual environments
+brd-env/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
