@@ -148,14 +148,23 @@ def test_authorization_url_requires_configuration():
 
 def test_requested_scopes_are_least_privilege():
     """
-    Read-only throughout. `read:jira-user` is added in JIRA-003 because the
+    Read-only throughout. `read:jira-user` was added in JIRA-003 because the
     accessible-resources endpoint reports only sites the token holds a Jira scope
-    for; nothing broader is requested, since nothing in the app writes to Jira.
+    for; `read:jira-work` is added in JIRA-004 because reading projects and their
+    create-screen metadata is project and issue data, which `read:jira-user`
+    ("user information in Jira") does not cover. Nothing broader is requested,
+    since nothing in the app writes to Jira.
     """
-    assert set(JiraService.SCOPES) == {"read:me", "read:jira-user", "offline_access"}
+    assert set(JiraService.SCOPES) == {
+        "read:me",
+        "read:jira-user",
+        "read:jira-work",
+        "offline_access",
+    }
     assert not [s for s in JiraService.SCOPES if s.startswith("write:")]
     assert not [s for s in JiraService.SCOPES if s.startswith("manage:")]
     assert JiraService.SITE_SCOPE in JiraService.SCOPES
+    assert JiraService.PROJECT_SCOPE in JiraService.SCOPES
 
 
 def test_setup_instructions_name_the_required_scopes_but_no_values(configured):
@@ -664,17 +673,22 @@ def test_section_renders_the_connected_state(jira_callback, monkeypatch):
 
 def test_service_cannot_create_anything_yet():
     """
-    The Jira integration is read-only so far. JIRA-003 adds site discovery
-    (`list_accessible_sites`); project discovery, metadata and issue creation
-    arrive in later tickets, so none of them exist here.
+    The Jira integration is read-only. JIRA-003 added site discovery and JIRA-004
+    adds project and create-metadata discovery -- all GETs. Issue creation arrives
+    in a later ticket, so no write entry point exists here.
     """
     for absent in (
-        "list_projects",
-        "get_create_metadata",
         "create_issue",
         "create_issues",
+        "create_project",
+        "update_issue",
+        "delete_issue",
     ):
         assert not hasattr(JiraService, absent), absent
+
+    # The read-only discovery surface, by contrast, is expected to be present.
+    for present in ("list_accessible_sites", "list_projects", "get_project_metadata"):
+        assert hasattr(JiraService, present), present
 
 
 def test_jira_is_not_offered_as_a_transcript_source():

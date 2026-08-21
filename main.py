@@ -545,10 +545,29 @@ def _connected_tokens(provider) -> Optional[TokenSet]:
     return tokens if isinstance(tokens, TokenSet) else None
 
 
+# Session-state suffixes holding the Jira project selection and its create-metadata.
+# Named once because three separate events have to clear exactly this set: choosing
+# a different site, re-querying the project list, and disconnecting.
+_JIRA_PROJECT_SUFFIXES = ("projects", "projects_site", "project", "metadata", "metadata_for")
+
+
 def _disconnect(provider) -> None:
     """Drop every trace of the provider session from this browser session."""
-    for suffix in ("tokens", "handshake", "discovery", "transcript", "identity", "sites", "site"):
+    suffixes = ("tokens", "handshake", "discovery", "transcript", "identity", "sites", "site")
+    for suffix in suffixes + _JIRA_PROJECT_SUFFIXES:
         st.session_state.pop(_skey(provider.name, suffix), None)
+
+
+def _clear_jira_project_state(service) -> None:
+    """
+    Forget the project list, the project selection and its metadata.
+
+    The picker's own widget state goes too: a shorter new list would leave a
+    stored index pointing past the end of it.
+    """
+    for suffix in _JIRA_PROJECT_SUFFIXES:
+        st.session_state.pop(_skey(service.name, suffix), None)
+    st.session_state.pop("select_jira_project", None)
 
 
 def _handle_oauth_callback() -> None:
@@ -992,6 +1011,9 @@ def _render_jira_sites_panel(service, tokens: TokenSet) -> None:
             # and the picker's own state has to go too: the new list may be shorter.
             st.session_state.pop(site_key, None)
             st.session_state.pop("select_jira_site", None)
+            # Whatever was selected here, the project list below was fetched for a
+            # site that may no longer be the selected one.
+            _clear_jira_project_state(service)
 
     sites = st.session_state.get(sites_key)
     if not isinstance(sites, list):
@@ -1043,13 +1065,216 @@ def _render_jira_sites_panel(service, tokens: TokenSet) -> None:
         )
 
 
+def _render_jira_projects_panel(service, tokens: TokenSet, site) -> None:
+    """
+    Steps 2 and 3: pick a project on the selected site, then read what creating an
+    issue in it would require. Read-only.
+
+    Reuses ``_provider_call`` for the spinner, the single refresh-and-retry on an
+    expired token, and the authentication / authorization / API error messages, so
+    Jira behaves like the transcript providers. Only non-secret identifiers and
+    discovered metadata are cached -- see ``JiraProject`` and
+    ``JiraProjectMetadata``.
+    """
+    projects_key = _skey(service.name, "projects")
+    projects_site_key = _skey(service.name, "projects_site")
+    project_key = _skey(service.name, "project")
+    metadata_key = _skey(service.name, "metadata")
+    metadata_for_key = _skey(service.name, "metadata_for")
+
+    # A project list belongs to one site. If the site selection moved, the cached
+    # list and everything derived from it describe the wrong site.
+    if st.session_state.get(projects_site_key) not in (None, site.id):
+        _clear_jira_project_state(service)
+
+    st.markdown("**Step 2 — choose a Jira project**")
+    if st.button("Retrieve projects on this site", key="discover_jira_projects"):
+        result = _provider_call(
+            service,
+            tokens,
+            lambda token: service.list_projects(access_token=token, cloud_id=site.id),
+            "Asking Jira which projects this account can see...",
+        )
+        if result is not None:
+            _clear_jira_project_state(service)
+            st.session_state[projects_key] = result
+            st.session_state[projects_site_key] = site.id
+
+    discovery = st.session_state.get(projects_key)
+    if not isinstance(discovery, dict):
+        st.caption(
+            "No project has been requested yet. This reads a list of projects and creates "
+            "nothing."
+        )
+        return
+
+    for note in discovery.get("notes") or []:
+        st.info(note)
+
+    projects = [p for p in (discovery.get("projects") or []) if p is not None]
+    if not projects:
+        st.session_state.pop(project_key, None)
+        granted = tuple(tokens.public_summary().get("scopes") or ())
+        if granted and service.PROJECT_SCOPE not in granted:
+            st.warning(
+                "Jira returned no project, and this session was authorized without the "
+                "`{}` scope — the one that grants project and issue data. Disconnect and "
+                "connect again to consent to the scopes this app now requests.".format(
+                    service.PROJECT_SCOPE
+                )
+            )
+        else:
+            st.warning(
+                "Jira returned no project on this site. Atlassian documents that a Jira "
+                "account's own permissions still apply whatever scopes were granted, so "
+                "this normally means the connected account cannot browse any project here. "
+                "Ask a Jira administrator for Browse Projects permission on the project you "
+                "need, or select a different site."
+            )
+        return
+
+    if len(projects) == 1:
+        project = projects[0]
+        st.caption("One project was returned, so it is selected automatically.")
+    else:
+        indices = list(range(len(projects)))
+        chosen = st.selectbox(
+            "Projects visible to this account on this site ({} found)".format(len(projects)),
+            indices,
+            format_func=lambda i: projects[i].display_label,
+            key="select_jira_project",
+        )
+        project = projects[chosen]
+
+    st.session_state[project_key] = project
+    st.success("Selected Jira project: {}".format(project.display_label))
+    if project.project_type_key:
+        st.caption("Jira reports this project's type as `{}`.".format(project.project_type_key))
+
+    # Metadata describes one project on one site, so it is cached against both.
+    wanted = (site.id, project.api_identifier)
+    if st.session_state.get(metadata_for_key) not in (None, wanted):
+        st.session_state.pop(metadata_key, None)
+        st.session_state.pop(metadata_for_key, None)
+
+    st.markdown("**Step 3 — check what this project requires**")
+    if st.button("Read issue types & required fields", key="discover_jira_metadata"):
+        result = _provider_call(
+            service,
+            tokens,
+            lambda token: service.get_project_metadata(
+                access_token=token,
+                cloud_id=site.id,
+                project_id_or_key=project.api_identifier,
+            ),
+            "Reading issue types and required fields for {}...".format(project.display_label),
+        )
+        if result is not None:
+            st.session_state[metadata_key] = result
+            st.session_state[metadata_for_key] = wanted
+
+    metadata = st.session_state.get(metadata_key)
+    if metadata is None:
+        st.caption(
+            "Not read yet. This reads the issue types Jira offers on this project's create "
+            "screen and the fields it marks required. It creates nothing."
+        )
+        return
+
+    _render_jira_project_metadata(metadata)
+
+
+def _render_jira_project_metadata(metadata) -> None:
+    """
+    Show the discovered issue types and the required-field check.
+
+    Nothing here names a hierarchy level: what Jira reported is what is shown,
+    because the target project's hierarchy is the project's own business.
+    """
+    for note in metadata.notes or ():
+        st.info(note)
+    if metadata.truncated:
+        st.warning(
+            "Not every issue type or field could be read in one pass — the notes above say "
+            "exactly what was skipped. Nothing was dropped silently."
+        )
+
+    if not metadata.issue_types:
+        st.warning(
+            "Jira reported no issue type for this project's create screen. That is a Jira "
+            "project configuration or permission matter, not something this app can change."
+        )
+        return
+
+    plannable = len(metadata.plannable_issue_types)
+    st.write(
+        "**{} issue type(s) discovered, {} of which passed the required-field check.** "
+        "Jira's own configuration decides these and their hierarchy; none of it is "
+        "assumed here.".format(len(metadata.issue_types), plannable)
+    )
+
+    icons = {"ok": "✅", "blocked": "⚠️", "unknown": "❓"}
+    for issue_type in metadata.issue_types:
+        state = issue_type.validation_state
+        header = "{} {} — {}".format(
+            icons.get(state, "❓"),
+            issue_type.name or issue_type.id,
+            issue_type.hierarchy_note,
+        )
+        with st.expander(header):
+            if issue_type.description:
+                st.caption(issue_type.description)
+
+            if state == "unknown":
+                st.warning(
+                    "The required fields for this issue type could not be read, so it has "
+                    "not been checked."
+                )
+            elif state == "blocked":
+                st.warning(
+                    "Jira requires field(s) here that a generated work plan has no source "
+                    "for: "
+                    + ", ".join(
+                        "`{}`".format(field.field_id)
+                        for field in issue_type.unsupported_required_fields
+                    )
+                )
+            else:
+                st.success(
+                    "Every field Jira requires here is one a work plan could supply, or one "
+                    "Jira defaults by itself."
+                )
+
+            if issue_type.required_fields:
+                st.write("Fields Jira marks required:")
+                for field in issue_type.required_fields:
+                    st.write(
+                        "- `{}` — {}{}{}".format(
+                            field.field_id,
+                            field.name or "no name reported",
+                            " ({})".format(field.schema_type) if field.schema_type else "",
+                            " · Jira supplies a default" if field.has_default_value else "",
+                        )
+                    )
+            elif state == "ok":
+                st.write("Jira marked no field as required for this issue type.")
+
+    st.caption(
+        "This checks Jira's required fields against the fields a later step would be able "
+        "to fill in. It is a pre-flight check, not a guarantee that Jira will accept a "
+        "given issue. Nothing has been created or changed in Jira."
+    )
+
+
 def _render_jira_section() -> None:
     """
-    The optional Jira Cloud connection and site selection.
+    The optional Jira Cloud connection, site selection, project selection and
+    create-metadata check.
 
-    Read-only: it connects an account and lists the sites that account granted
-    access to. There is no project selection, no work plan and no issue creation
-    here, so a connected session cannot change anything in Jira. It renders
+    Read-only throughout: it connects an account, lists the sites that account
+    granted access to, lists the projects it can see on the chosen site, and reads
+    what creating an issue there would require. There is no work plan and no issue
+    creation here, so a connected session cannot change anything in Jira. It renders
     regardless of whether a BRD exists, because the OAuth redirect re-runs the
     script with no transcript in hand and the connected state still has to be
     visible when the user returns.
@@ -1088,11 +1313,30 @@ def _render_jira_section() -> None:
         return
 
     _render_connected_panel(service, tokens)
+
+    # A session authorized before a scope was added keeps the narrower grant, and a
+    # refresh cannot widen it. Saying so here beats letting the user hit a 403 and
+    # guess whether it was scopes or Jira permissions.
+    stale = service.missing_scopes(tokens.public_summary().get("scopes"))
+    if stale:
+        st.warning(
+            "This Jira session was authorized before the app requested "
+            + ", ".join("`{}`".format(scope) for scope in stale)
+            + ". Atlassian grants scopes at consent time and a token refresh cannot add "
+            "one, so the steps below will fail until you disconnect and connect again."
+        )
+
     _render_jira_sites_panel(service, tokens)
+
+    site = st.session_state.get(_skey(service.name, "site"))
+    if site is not None:
+        _render_jira_projects_panel(service, tokens, site)
+
     st.caption(
-        "Authorized to read your Atlassian identity and the Jira sites you granted. Nothing "
-        "has been created or changed in Jira, and no issue can be created without your "
-        "explicit confirmation."
+        "Authorized to read your Atlassian identity, the Jira sites you granted, and the "
+        "projects and create-screen metadata on the site you select. Nothing has been "
+        "created or changed in Jira, and no issue can be created without your explicit "
+        "confirmation."
     )
 
 

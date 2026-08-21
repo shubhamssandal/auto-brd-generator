@@ -511,7 +511,7 @@ def test_disconnect_clears_the_discovered_sites_and_selection(configured):
 
 # --- Read-only boundary ---------------------------------------------------
 
-def test_site_discovery_adds_no_project_or_issue_capability():
-    """JIRA-004 adds projects and metadata; JIRA-003 must not reach ahead."""
-    for absent in ("list_projects", "get_create_metadata", "create_issue", "create_issues"):
+def test_site_discovery_adds_no_write_capability():
+    """Discovery is GET-only; issue creation belongs to a later ticket."""
+    for absent in ("create_issue", "create_issues", "update_issue", "delete_issue"):
         assert not hasattr(JiraService, absent), absent

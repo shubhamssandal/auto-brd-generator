@@ -4,10 +4,11 @@ Jira Cloud OAuth 2.0 (3LO) connection.
 Scope of this module
 --------------------
 Obtaining and renewing an authorization for a Jira Cloud account, identifying it,
-and listing the Jira Cloud sites that authorization can reach. Project discovery,
-Jira metadata and issue creation are deliberately absent: they arrive in their own
-tickets, and keeping them out means a connected session here cannot write anything
-to Jira. Every request this module makes is a GET.
+and reading -- read-only, always with GET -- the Jira Cloud sites that
+authorization can reach, the projects visible on one site, and what a chosen
+project would require in order to create an issue. Issue creation is deliberately
+absent: it arrives in its own ticket, and keeping it out means a connected session
+here cannot write anything to Jira. Every request this module makes is a GET.
 
 Why this is not a TranscriptProvider
 ------------------------------------
@@ -34,12 +35,19 @@ client secret.
 """
 
 import urllib.parse
+from dataclasses import replace
 from typing import Any, Optional
 
 import requests
 
 import jira_config
-from jira_models import JiraSite
+from jira_models import (
+    JiraField,
+    JiraIssueType,
+    JiraProject,
+    JiraProjectMetadata,
+    JiraSite,
+)
 from providers.base import (
     ProviderAPIError,
     ProviderAuthenticationError,
@@ -65,21 +73,60 @@ class JiraService:
     # The Jira scope that makes a site appear in accessible-resources at all. The
     # endpoint "retrieve[s] the sites that have scopes granted by the token", so a
     # token holding only account-level scopes lists no Jira site, however many the
-    # user owns. read:jira-user is the narrower of the two documented read-only
-    # classic Jira scopes -- read:jira-work also grants project and issue data,
-    # which nothing in this ticket reads.
+    # user owns.
     SITE_SCOPE = "read:jira-user"
 
+    # Reading projects and create-metadata needs more than user information:
+    # Atlassian's own description of read:jira-work is "Read Jira project and issue
+    # data, search for issues and objects associated with issues like attachments
+    # and worklogs", while read:jira-user is confined to "user information in Jira".
+    # This is the classic scope, which Atlassian's scopes reference recommends over
+    # the granular equivalents. It is read-only: the write counterpart is a separate
+    # scope (write:jira-work) and is not requested.
+    PROJECT_SCOPE = "read:jira-work"
+
     # Least privilege for this ticket: the connected account's identity so the UI
-    # can say who is signed in, one read-only Jira scope so accessible sites can
-    # be listed at all, and a refresh token. Nothing here can write to Jira.
+    # can say who is signed in, two read-only Jira scopes so accessible sites,
+    # projects and create-metadata can be read, and a refresh token. Nothing here
+    # can write to Jira.
     SCOPES = [
         "read:me",
         SITE_SCOPE,
+        PROJECT_SCOPE,
         "offline_access",
     ]
 
     TIMEOUT_SECONDS = 30
+
+    # --- Site-scoped product API ------------------------------------------
+    #
+    # VERIFICATION NOTE. The base below is documented: Atlassian's 3LO page gives
+    # the template "https://api.atlassian.com/ex/jira/{cloudid}/{api}" and states
+    # that 3LO calls must not be sent to a your-domain.atlassian.net host.
+    #
+    # The three paths are NOT verified against Atlassian's documentation in the
+    # environment this was written in: every /rest/v3/api-group-* reference page
+    # renders client-side and returns no body to a text fetch, and the published
+    # OpenAPI document truncates inside `components` before reaching `paths`. They
+    # are the paths the Jira Cloud platform REST API v3 is understood to expose,
+    # but treat them as unconfirmed until someone with a browser diffs them against
+    # the reference. The response parsing below is deliberately tolerant for the
+    # same reason -- see ``_paged_values``.
+    API_BASE = "https://api.atlassian.com/ex/jira"
+    PROJECT_SEARCH_PATH = "/rest/api/3/project/search"
+    ISSUE_TYPES_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes"
+    ISSUE_TYPE_FIELDS_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes/{issue_type}"
+
+    # Bounded pagination, matching the Google and Microsoft providers. The cap is a
+    # backstop against a server that ignores startAt; hitting it is reported rather
+    # than swallowed.
+    PAGE_SIZE = 50
+    MAX_PAGES = 20
+
+    # Reading required fields costs one request per issue type, so a project with an
+    # unusual number of them is capped. The uninspected types are still listed, just
+    # marked unvalidated.
+    MAX_ISSUE_TYPES_INSPECTED = 25
 
     # --- Identity for the shared UI helpers --------------------------------
 
@@ -127,12 +174,37 @@ class JiraService:
             "\n\n**Scopes to enable** on the app's Permissions screen, or authorization "
             "will be rejected:\n\n"
             + "".join("- `{}`\n".format(scope) for scope in self.SCOPES)
-            + "\nAll three are read-only: `read:me` shows which Atlassian account is "
-            "connected, `{}` is what makes your Jira sites visible to the "
-            "accessible-resources endpoint, and `offline_access` returns a refresh token. "
-            "No write or manage scope is requested, because nothing in this app can "
-            "change anything in Jira.".format(self.SITE_SCOPE)
+            + "\nAll of these are read-only: `read:me` shows which Atlassian account is "
+            "connected, `{site}` is what makes your Jira sites visible to the "
+            "accessible-resources endpoint, `{project}` is what allows projects and their "
+            "create-screen metadata to be read, and `offline_access` returns a refresh "
+            "token. No write or manage scope is requested, because nothing in this app can "
+            "change anything in Jira.\n\nScopes are granted when you consent, and a token "
+            "refresh cannot add one. If you connected this app before a scope was added to "
+            "the list above, disconnect and connect again so Atlassian shows the consent "
+            "screen for the current set.".format(
+                site=self.SITE_SCOPE, project=self.PROJECT_SCOPE
+            )
         )
+
+    def missing_scopes(self, granted: Any) -> list[str]:
+        """
+        Which of the scopes this app now requests are absent from a live session.
+
+        A session authorized before a scope was added keeps the older, narrower
+        grant: Atlassian issues scopes at consent time, documents that a new
+        grant's scopes override the previous ones, and returns the granted
+        ``scope`` on the token response -- so comparing that against ``SCOPES`` is
+        the way to notice the mismatch before an API call fails with a 403.
+
+        An empty ``granted`` returns nothing. Some providers omit ``scope`` from
+        the token response entirely, and silence is not evidence of absence; the
+        alternative would be telling a perfectly good session to reconnect.
+        """
+        held = {str(scope).strip() for scope in (granted or ()) if str(scope).strip()}
+        if not held:
+            return []
+        return [scope for scope in self.SCOPES if scope not in held]
 
     # --- OAuth -------------------------------------------------------------
 
@@ -304,7 +376,7 @@ class JiraService:
         text = str(getattr(response, "text", "") or "").strip()
         return text[:400] if text else "no further detail was returned"
 
-    def _api_get(self, url: str, access_token: str):
+    def _api_get(self, url: str, access_token: str, params: Optional[dict] = None):
         """
         GET an Atlassian endpoint, mapping HTTP status onto the shared provider
         error hierarchy so ``_provider_call`` can react the same way it does for
@@ -318,6 +390,7 @@ class JiraService:
                     "Authorization": "Bearer {}".format(access_token),
                     "Accept": "application/json",
                 },
+                params=params or None,
                 timeout=self.TIMEOUT_SECONDS,
             )
         except requests.RequestException as e:
@@ -348,6 +421,22 @@ class JiraService:
             "Atlassian returned HTTP {}: {}".format(status, detail), status_code=status
         )
 
+    @staticmethod
+    def _json_body(response, what: str):
+        """
+        Decode a successful Atlassian response, or say which call broke.
+
+        ``what`` names the call so an error reaches the user as "the project search
+        response was not valid JSON" rather than as a bare parse failure.
+        """
+        try:
+            return response.json()
+        except Exception:
+            raise ProviderAPIError(
+                "Atlassian's {} response was not valid JSON.".format(what),
+                status_code=getattr(response, "status_code", None),
+            )
+
     def list_accessible_sites(self, access_token: str) -> list[JiraSite]:
         """
         The Jira Cloud sites this authorization can reach.
@@ -362,14 +451,7 @@ class JiraService:
         answers with a failure or with a body that is not the documented shape.
         """
         response = self._api_get(self.ACCESSIBLE_RESOURCES_URL, access_token)
-
-        try:
-            payload = response.json()
-        except Exception:
-            raise ProviderAPIError(
-                "Atlassian's accessible-resources response was not valid JSON.",
-                status_code=getattr(response, "status_code", None),
-            )
+        payload = self._json_body(response, "accessible-resources")
 
         if not isinstance(payload, list):
             raise ProviderAPIError(
@@ -389,3 +471,279 @@ class JiraService:
                 "so none can be used.".format(len(payload))
             )
         return sites
+
+    # --- Read-only project and create-metadata discovery -------------------
+
+    def site_api_url(self, cloud_id: str, path: str) -> str:
+        """
+        Address a REST path on one Jira site.
+
+        3LO tokens are used against ``api.atlassian.com/ex/jira/{cloudid}`` and,
+        per Atlassian's own wording, must not be sent to a site's own
+        ``your-domain.atlassian.net`` host. The cloud id is URL-quoted because it
+        arrives from an API response and lands in a path segment.
+        """
+        site = str(cloud_id or "").strip()
+        if not site:
+            raise ProviderAPIError(
+                "No Jira site is selected, so there is no site to query. "
+                "Choose a Jira site first."
+            )
+        return "{}/{}/{}".format(
+            self.API_BASE.rstrip("/"),
+            urllib.parse.quote(site, safe=""),
+            path.lstrip("/"),
+        )
+
+    def _paged_values(
+        self,
+        url: str,
+        access_token: str,
+        what: str,
+        collection_keys: tuple = ("values",),
+        params: Optional[dict] = None,
+        max_pages: Optional[int] = None,
+    ) -> tuple:
+        """
+        Collect every page of a Jira ``startAt``/``maxResults`` collection.
+
+        Returns ``(items, truncated)``, matching ``_paginate`` in the Google and
+        Microsoft providers; ``truncated`` is True only when the page cap stopped
+        the walk while Jira still had more to give.
+
+        Tolerant on purpose. The exact envelope for these endpoints could not be
+        confirmed from Atlassian's reference (see the VERIFICATION NOTE on the path
+        constants), so this accepts a bare JSON array as an unpaginated answer,
+        accepts the collection under any of ``collection_keys``, and treats several
+        independent signals as end-of-collection. What it will not do is guess: an
+        envelope carrying none of the expected keys raises rather than quietly
+        reporting an empty collection, because "no projects" and "the response
+        changed shape" must not look the same to the user.
+        """
+        items: list = []
+        start_at = 0
+        pages = 0
+        limit = self.MAX_PAGES if max_pages is None else max_pages
+
+        while True:
+            page_params = dict(params or {})
+            page_params["startAt"] = start_at
+            page_params["maxResults"] = self.PAGE_SIZE
+
+            body = self._json_body(
+                self._api_get(url, access_token, params=page_params), what
+            )
+
+            # A bare array is an unpaginated answer; there is no next page to ask for.
+            if isinstance(body, list):
+                return list(body), False
+            if not isinstance(body, dict):
+                raise ProviderAPIError(
+                    "Atlassian's {} response was neither a JSON object nor a JSON "
+                    "array.".format(what)
+                )
+
+            values = None
+            for key in collection_keys:
+                candidate = body.get(key)
+                if isinstance(candidate, list):
+                    values = candidate
+                    break
+            if values is None:
+                raise ProviderAPIError(
+                    "Atlassian's {} response carried no {} array, so its contents cannot "
+                    "be read.".format(
+                        what, " or ".join("`{}`".format(k) for k in collection_keys)
+                    )
+                )
+
+            items.extend(values)
+            pages += 1
+
+            if body.get("isLast") is True:
+                return items, False
+            total = body.get("total")
+            if isinstance(total, int) and not isinstance(total, bool) and len(items) >= total:
+                return items, False
+            if not values:
+                return items, False
+            if body.get("isLast") is None and not isinstance(total, int):
+                # Neither documented end-of-collection signal came back, so a page
+                # that did not fill is the only remaining evidence that it was the
+                # last one. Jira caps maxResults per endpoint, so the server's own
+                # echoed value is what "full" means -- using the requested size here
+                # would end the walk early and drop rows silently.
+                advertised = body.get("maxResults")
+                page_limit = (
+                    advertised
+                    if isinstance(advertised, int)
+                    and not isinstance(advertised, bool)
+                    and advertised > 0
+                    else self.PAGE_SIZE
+                )
+                if len(values) < page_limit:
+                    return items, False
+            if pages >= limit:
+                return items, True
+
+            start_at = len(items)
+
+    def list_projects(self, access_token: str, cloud_id: str) -> dict[str, Any]:
+        """
+        The projects the connected account can see on one Jira site.
+
+        Read-only. Returns ``{"projects": [...], "truncated": bool,
+        "notes": [...]}``, the same shape the transcript providers use for
+        discovery, so an incomplete answer can be shown as incomplete.
+
+        An empty project list is a legitimate answer: Atlassian documents that a
+        Jira account's own permissions still apply whatever the token was granted,
+        so a scope-complete session can still see nothing. The caller decides how
+        to explain that.
+        """
+        url = self.site_api_url(cloud_id, self.PROJECT_SEARCH_PATH)
+        raw, truncated = self._paged_values(url, access_token, "project search")
+
+        projects = [
+            project
+            for project in (JiraProject.from_api(item) for item in raw)
+            if project is not None
+        ]
+
+        # Same reasoning as list_accessible_sites: a body this app cannot read must
+        # not be presented as "this account has no projects".
+        if raw and not projects:
+            raise ProviderAPIError(
+                "Jira listed {} project(s), but none carried an id or a key, so none can "
+                "be used.".format(len(raw))
+            )
+
+        notes: list[str] = []
+        if truncated:
+            notes.append(
+                "More projects exist on this site than were listed: the walk stopped after "
+                "{} pages of {}. Nothing was dropped silently, but the list below is "
+                "incomplete.".format(self.MAX_PAGES, self.PAGE_SIZE)
+            )
+        return {"projects": projects, "truncated": truncated, "notes": notes}
+
+    def get_project_metadata(
+        self,
+        access_token: str,
+        cloud_id: str,
+        project_id_or_key: str,
+    ) -> JiraProjectMetadata:
+        """
+        What one project would require in order to create an issue in it.
+
+        Read-only, and this is the whole of what "metadata" means here: the issue
+        types Jira offers on this project's create screen, and for each of them the
+        fields Jira marks required. Nothing is created, and nothing about issue
+        hierarchy is assumed -- ``subtask`` and ``hierarchyLevel`` are recorded as
+        Jira reported them.
+
+        Costs one request for the issue types plus one per issue type for its
+        fields. A field lookup that fails with an API error is recorded as a note
+        and the issue type is marked unvalidated, so one awkward issue type does not
+        lose the whole project. Authentication and authorization failures are left
+        to propagate: those need the shared refresh-and-retry and re-consent paths,
+        not a note, and every request here is a GET so retrying the whole operation
+        is safe.
+        """
+        identifier = str(project_id_or_key or "").strip()
+        if not identifier:
+            raise ProviderAPIError(
+                "No Jira project is selected, so there is no metadata to read."
+            )
+        quoted_project = urllib.parse.quote(identifier, safe="")
+
+        notes: list[str] = []
+        types_url = self.site_api_url(
+            cloud_id, self.ISSUE_TYPES_PATH.format(project=quoted_project)
+        )
+        raw_types, truncated = self._paged_values(
+            types_url,
+            access_token,
+            "create-metadata issue types",
+            collection_keys=("values", "issueTypes"),
+        )
+        if truncated:
+            notes.append(
+                "More issue types exist on this project than were listed, so the set below "
+                "is incomplete."
+            )
+
+        issue_types: list = []
+        inspected = 0
+        skipped_for_cap = 0
+
+        for raw in raw_types:
+            issue_type = JiraIssueType.from_api(raw)
+            if issue_type is None:
+                continue
+
+            if inspected >= self.MAX_ISSUE_TYPES_INSPECTED:
+                # Listed but not validated: honest, and cheaper than a request per
+                # type on a project with an unusual number of them.
+                skipped_for_cap += 1
+                truncated = True
+                issue_types.append(issue_type)
+                continue
+            inspected += 1
+
+            fields_url = self.site_api_url(
+                cloud_id,
+                self.ISSUE_TYPE_FIELDS_PATH.format(
+                    project=quoted_project,
+                    issue_type=urllib.parse.quote(issue_type.id, safe=""),
+                ),
+            )
+            label = issue_type.name or issue_type.id
+            try:
+                raw_fields, fields_truncated = self._paged_values(
+                    fields_url,
+                    access_token,
+                    "create-metadata fields for '{}'".format(label),
+                    collection_keys=("values", "fields"),
+                )
+            except ProviderAPIError as e:
+                notes.append(
+                    "Required fields for '{}' could not be read, so it is listed but not "
+                    "validated: {}".format(label, e)
+                )
+                issue_types.append(issue_type)
+                continue
+
+            required = tuple(
+                field
+                for field in (JiraField.from_api(item) for item in raw_fields)
+                if field is not None and field.required
+            )
+            if fields_truncated:
+                truncated = True
+                notes.append(
+                    "Not every field for '{}' could be listed, so it is listed but not "
+                    "validated.".format(label)
+                )
+            issue_types.append(
+                replace(
+                    issue_type,
+                    required_fields=required,
+                    fields_known=not fields_truncated,
+                )
+            )
+
+        if skipped_for_cap:
+            notes.append(
+                "{} issue type(s) beyond the first {} were listed without reading their "
+                "required fields, so they are shown as unvalidated.".format(
+                    skipped_for_cap, self.MAX_ISSUE_TYPES_INSPECTED
+                )
+            )
+
+        return JiraProjectMetadata(
+            project_identifier=identifier,
+            issue_types=tuple(issue_types),
+            notes=tuple(notes),
+            truncated=truncated,
+        )
