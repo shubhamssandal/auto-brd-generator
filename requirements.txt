@@ -1,5 +1,11 @@
-streamlit
-google-genai
-python-dotenv
-pytest
-requests
+# Runtime
+streamlit>=1.35.0
+google-genai>=1.47.0
+python-dotenv>=1.0.1
+requests>=2.32.5
+
+# Testing
+pytest>=8.2.2
+
+# No OAuth SDK is required: the Google and Microsoft flows are plain OAuth 2.0
+# authorization-code exchanges over `requests`.

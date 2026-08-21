@@ -21,7 +21,24 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
-from providers import GoogleMeetProvider, MSTeamsProvider
+from providers import (
+    GoogleMeetProvider,
+    MSTeamsProvider,
+    OAuthHandshake,
+    OAuthStateError,
+    ProviderAPIError,
+    ProviderAuthenticationError,
+    ProviderConsentRequiredError,
+    ProviderError,
+    ProviderNotConfiguredError,
+    ProviderTokenExpiredError,
+    TokenSet,
+    TranscriptParseError,
+    TranscriptUnavailableError,
+    begin_handshake,
+    call_with_refresh,
+    resolve_handshake,
+)
 
 
 # Load environment variables from a .env file
@@ -441,6 +458,531 @@ def display_brd(brd_data: BRDData):
 
 
 
+# --- Provider Session Helpers (Streamlit UI layer) ---
+#
+# Every provider shares this code path: connect -> discover -> select -> preview ->
+# the one BRD pipeline below. Access and refresh tokens live only in Streamlit's
+# server-side session state; they are never rendered, logged, or written to disk.
+
+PROVIDER_CLASSES = {
+    "google_meet": GoogleMeetProvider,
+    "microsoft_teams": MSTeamsProvider,
+}
+
+
+def _redirect_uri() -> str:
+    """The registered OAuth redirect URI; must match the provider console entry."""
+    return os.getenv("APP_REDIRECT_URI", "").strip() or "http://localhost:8501"
+
+
+def _skey(provider_name: str, suffix: str) -> str:
+    """Namespaced session-state key for one provider."""
+    return f"{provider_name}__{suffix}"
+
+
+def _flash(kind: str, message: str) -> None:
+    """
+    Queue a message for the next render.
+
+    The OAuth callback clears the query string, which re-runs the script, so a
+    message written directly at callback time would vanish before it was seen.
+    """
+    flashes = st.session_state.get("_flashes")
+    if not isinstance(flashes, list):
+        flashes = []
+    flashes.append((kind, message))
+    st.session_state["_flashes"] = flashes
+
+
+def _render_flashes() -> None:
+    flashes = st.session_state.get("_flashes")
+    if not isinstance(flashes, list) or not flashes:
+        return
+    st.session_state["_flashes"] = []
+    for kind, message in flashes:
+        if kind == "success":
+            st.success(message)
+        elif kind == "warning":
+            st.warning(message)
+        elif kind == "info":
+            st.info(message)
+        else:
+            st.error(message)
+
+
+def _report_provider_error(display_name: str, error: Exception) -> None:
+    """Explain a provider failure without exposing tokens or credential values."""
+    if isinstance(error, ProviderNotConfiguredError):
+        st.error(f"{display_name} is not configured: {error}")
+    elif isinstance(error, ProviderConsentRequiredError):
+        st.error(f"{display_name} refused this request as unauthorized. {error}")
+    elif isinstance(error, ProviderTokenExpiredError):
+        st.error(
+            f"The {display_name} session expired and could not be renewed. "
+            f"Please connect again. ({error})"
+        )
+    elif isinstance(error, ProviderAuthenticationError):
+        st.error(f"{display_name} authentication failed: {error}")
+    elif isinstance(error, TranscriptUnavailableError):
+        st.warning(f"No transcript is available: {error}")
+    elif isinstance(error, TranscriptParseError):
+        st.error(f"The {display_name} transcript could not be parsed: {error}")
+    elif isinstance(error, ProviderAPIError):
+        st.error(f"{display_name} API error: {error}")
+    elif isinstance(error, ProviderError):
+        st.error(f"{display_name} error: {error}")
+    else:
+        st.error(f"Unexpected error while contacting {display_name}: {error}")
+
+
+def _connected_tokens(provider) -> Optional[TokenSet]:
+    tokens = st.session_state.get(_skey(provider.name, "tokens"))
+    return tokens if isinstance(tokens, TokenSet) else None
+
+
+def _disconnect(provider) -> None:
+    """Drop every trace of the provider session from this browser session."""
+    for suffix in ("tokens", "handshake", "discovery", "transcript", "identity"):
+        st.session_state.pop(_skey(provider.name, suffix), None)
+
+
+def _handle_oauth_callback() -> None:
+    """
+    Process an OAuth redirect back to this page.
+
+    Denials are reported and dropped. A ``code`` is only exchanged after the signed
+    ``state`` verifies, which is both the CSRF check and the provider routing: the
+    state is HMAC-signed by this process, so a forged or replayed value is rejected
+    and no token is ever stored for it.
+    """
+    query_params = st.query_params
+
+    if "error" in query_params:
+        error_code = str(query_params.get("error", "")).strip()
+        description = str(query_params.get("error_description", "")).strip()
+        if error_code == "access_denied":
+            _flash(
+                "warning",
+                "Authorization was declined, so no account was connected. "
+                "Manual Paste and TXT Upload are unaffected.",
+            )
+        else:
+            _flash(
+                "error",
+                "The provider returned an authorization error"
+                + (f" ({error_code})" if error_code else "")
+                + "."
+                + (f" {description}" if description else ""),
+            )
+        st.query_params.clear()
+        return
+
+    if "code" not in query_params:
+        return
+
+    oauth_code = str(query_params.get("code", ""))
+    oauth_state = str(query_params.get("state", ""))
+
+    try:
+        handshake = resolve_handshake(oauth_state)
+    except OAuthStateError as e:
+        # Unverifiable state: a forged/replayed callback, a stale link, or an app
+        # restart. Nothing is exchanged and no session is created.
+        _flash(
+            "error",
+            f"This sign-in could not be verified ({e}), so it was rejected. "
+            "Start the connection again from this page.",
+        )
+        st.query_params.clear()
+        return
+
+    provider_cls = PROVIDER_CLASSES.get(handshake.provider)
+    if provider_cls is None:
+        _flash("error", "The sign-in response named an unknown provider and was ignored.")
+        st.query_params.clear()
+        return
+
+    provider = provider_cls()
+    try:
+        raw_tokens = provider.exchange_code_for_token(
+            oauth_code,
+            _redirect_uri(),
+            code_verifier=handshake.code_verifier,
+        )
+        tokens = TokenSet.from_response(raw_tokens)
+        st.session_state[_skey(handshake.provider, "tokens")] = tokens
+        st.session_state.pop(_skey(handshake.provider, "handshake"), None)
+        st.session_state.pop(_skey(handshake.provider, "identity"), None)
+        message = (
+            f"Connected to {provider.display_name}. "
+            f"Select **{provider.display_name}** under Transcript Source to continue."
+        )
+        if not tokens.can_refresh():
+            message += (
+                " Note: no refresh token was issued, so this session ends when the "
+                "access token expires."
+            )
+        _flash("success", message)
+    except Exception as e:
+        _flash("error", f"{provider.display_name} sign-in could not be completed: {e}")
+    finally:
+        st.query_params.clear()
+
+
+def _provider_call(provider, tokens: TokenSet, operation, spinner_text: str):
+    """
+    Run one provider operation with expiry-aware refresh and a single 401 retry.
+
+    Returns None and renders an explanation if the call fails. A dead session is
+    cleared so the UI offers "Connect" again instead of looping on a bad token.
+    """
+    try:
+        with st.spinner(spinner_text):
+            result, refreshed = call_with_refresh(provider, tokens, operation)
+        st.session_state[_skey(provider.name, "tokens")] = refreshed
+        return result
+    except ProviderConsentRequiredError as e:
+        _report_provider_error(provider.display_name, e)
+        return None
+    except ProviderAuthenticationError as e:
+        _disconnect(provider)
+        _report_provider_error(provider.display_name, e)
+        return None
+    except Exception as e:
+        _report_provider_error(provider.display_name, e)
+        return None
+
+
+def _identity_label(provider, tokens: TokenSet) -> Optional[str]:
+    """Best-effort 'signed in as' label. Never shows any token material."""
+    key = _skey(provider.name, "identity")
+    if key in st.session_state:
+        return st.session_state[key]
+
+    try:
+        profile = provider.get_user_profile(tokens.access_token) or {}
+    except Exception:
+        profile = {}
+
+    label = None
+    for field in ("email", "mail", "userPrincipalName", "displayName", "name"):
+        value = str(profile.get(field) or "").strip()
+        if value:
+            label = value
+            break
+
+    st.session_state[key] = label
+    return label
+
+
+def _render_connect_button(provider) -> None:
+    """Render the authorization link, issuing a fresh signed state + PKCE pair."""
+    handshake_key = _skey(provider.name, "handshake")
+    handshake = st.session_state.get(handshake_key)
+    if not isinstance(handshake, OAuthHandshake) or handshake.is_stale():
+        handshake = begin_handshake(provider.name)
+        st.session_state[handshake_key] = handshake
+
+    try:
+        auth_url = provider.get_authorization_url(
+            _redirect_uri(),
+            state=handshake.state,
+            code_challenge=handshake.code_challenge,
+            code_challenge_method=handshake.code_challenge_method,
+        )
+    except ProviderError as e:
+        _report_provider_error(provider.display_name, e)
+        return
+
+    st.link_button(f"Connect {provider.display_name}", auth_url, type="primary")
+    st.caption(
+        "You will authorize read-only access on the provider's own sign-in page and be "
+        "returned here. The request carries a signed, single-use state value and a PKCE "
+        "challenge; your credentials are never seen by this app."
+    )
+
+
+def _render_connected_panel(provider, tokens: TokenSet) -> None:
+    summary = tokens.public_summary()
+    left, right = st.columns([4, 1])
+
+    with left:
+        st.success(f"Connected to {provider.display_name}")
+        identity = _identity_label(provider, tokens)
+        if identity:
+            st.caption(f"Signed in as {identity}")
+        remaining = summary.get("expires_in_seconds")
+        if remaining is None:
+            st.caption("Access token: the provider advertised no expiry.")
+        else:
+            st.caption(
+                "Access token expires in ~{} minute(s). Automatic renewal: {}.".format(
+                    max(0, int(remaining) // 60),
+                    "available" if summary.get("has_refresh_token") else "unavailable",
+                )
+            )
+
+    with right:
+        if st.button("Disconnect", key=f"disconnect_{provider.name}"):
+            _disconnect(provider)
+            st.rerun()
+
+    if summary.get("scopes"):
+        with st.expander("Granted scopes"):
+            for scope in summary["scopes"]:
+                st.write(f"- `{scope}`")
+
+    st.caption(
+        "Tokens stay in this session's server-side state only. They are never displayed, "
+        "logged, or saved to disk."
+    )
+
+
+def _render_entry_metadata(entry: dict) -> None:
+    """Show exactly what the provider reported for the selected meeting."""
+    title = entry.get("title")
+    date = entry.get("date")
+    participants = entry.get("participants") or []
+
+    st.write(f"**Meeting title:** {title if title else '_not provided by this API_'}")
+    st.write(f"**Date / time:** {date if date else '_not provided by this API_'}")
+    if participants:
+        st.write("**Participants:** " + ", ".join(str(p) for p in participants))
+    else:
+        st.caption("Participants: not provided by this API for this meeting.")
+
+    details = {k: v for k, v in (entry.get("details") or {}).items() if v not in (None, "", [], {})}
+    if details:
+        with st.expander("Provider metadata"):
+            st.json(details)
+
+
+def _render_discovery_panel(provider, tokens: TokenSet) -> None:
+    """Steps 1 and 2: list what the account can reach, then load one transcript."""
+    name = provider.name
+    discovery_key = _skey(name, "discovery")
+
+    st.markdown("**Step 1 — find meetings with transcripts**")
+    if st.button("Retrieve available meetings & transcripts", key=f"discover_{name}"):
+        result = _provider_call(
+            provider,
+            tokens,
+            lambda token: provider.discover_transcripts(access_token=token),
+            f"Querying {provider.display_name} for meetings and transcripts...",
+        )
+        if result is not None:
+            st.session_state[discovery_key] = result
+
+    discovery = st.session_state.get(discovery_key)
+    if not isinstance(discovery, dict):
+        return
+
+    for note in discovery.get("notes") or []:
+        st.info(note)
+    if discovery.get("truncated"):
+        st.warning(
+            "Not every meeting could be listed in one pass — see the notes above for exactly "
+            "what was skipped. Nothing was dropped silently."
+        )
+
+    entries = [e for e in (discovery.get("transcripts") or []) if isinstance(e, dict)]
+    if not entries:
+        st.warning(
+            f"{provider.display_name} returned no retrievable transcripts for this account."
+        )
+        return
+
+    st.markdown("**Step 2 — choose a transcript**")
+    indices = list(range(len(entries)))
+    chosen = st.selectbox(
+        f"Transcripts available to this account ({len(entries)} found)",
+        indices,
+        format_func=lambda i: str(
+            entries[i].get("display_label") or entries[i].get("title") or entries[i].get("id")
+        ),
+        key=f"select_{name}",
+    )
+    entry = entries[chosen]
+    _render_entry_metadata(entry)
+
+    if not entry.get("available", True):
+        st.warning(
+            "The provider reports this transcript is not ready to download yet. "
+            "Loading it may fail until the file has been generated."
+        )
+
+    if st.button("Load transcript", key=f"load_{name}"):
+        loaded = _load_transcript(provider, tokens, entry.get("id"), entry.get("title"))
+        if loaded is not None:
+            st.session_state[_skey(name, "transcript")] = loaded
+            st.rerun()
+
+
+def _load_transcript(
+    provider,
+    tokens: TokenSet,
+    identifier,
+    meeting_title: Optional[str] = None,
+) -> Optional[NormalizedTranscript]:
+    """Retrieve one transcript and normalize it into the shared model."""
+    resource = str(identifier or "").strip()
+    if not resource:
+        st.error("No transcript identifier was selected.")
+        return None
+
+    transcript = _provider_call(
+        provider,
+        tokens,
+        lambda token: provider.get_transcript(resource, access_token=token),
+        f"Retrieving the transcript from {provider.display_name}...",
+    )
+    if transcript is None:
+        return None
+
+    # Carry across the real title the provider reported during discovery when the
+    # transcript resource itself has none. Nothing is invented here.
+    if meeting_title and not transcript.meeting_title:
+        transcript.meeting_title = str(meeting_title)
+    return transcript
+
+
+def _render_manual_fallback(provider, tokens: TokenSet) -> None:
+    """Identifier entry for meetings discovery cannot reach."""
+    name = provider.name
+    if name == "google_meet":
+        label = "Conference record, transcript resource, or Drive document id"
+        placeholder = "conferenceRecords/abc-123 or a Google Drive document id"
+        help_text = (
+            "Use this when you already know the identifier: a Meet conference record "
+            "(`conferenceRecords/...`), a transcript resource "
+            "(`conferenceRecords/.../transcripts/...`), or the id of the Google Docs "
+            "transcript file in Drive."
+        )
+    else:
+        label = "Teams join URL or transcript resource"
+        placeholder = "https://teams.microsoft.com/l/meetup-join/... or {meetingId}/transcripts/{transcriptId}"
+        help_text = (
+            "Use this for meetings that are not on your calendar. Microsoft Graph can only "
+            "look up an online meeting by its join URL, so paste the full "
+            "'Join Microsoft Teams Meeting' link."
+        )
+
+    with st.expander("Or enter an identifier manually"):
+        st.caption(help_text)
+        value = st.text_input(label, placeholder=placeholder, key=f"manual_{name}")
+        if st.button("Load transcript from identifier", key=f"manual_load_{name}"):
+            if not value.strip():
+                st.error("Enter an identifier first.")
+            else:
+                loaded = _load_transcript(provider, tokens, value.strip())
+                if loaded is not None:
+                    st.session_state[_skey(name, "transcript")] = loaded
+                    st.rerun()
+
+
+def _render_loaded_transcript(provider) -> Optional[NormalizedTranscript]:
+    """
+    Step 3: preview the retrieved transcript and hand it to the shared pipeline.
+
+    Returns the transcript only when the user presses Generate, so provider
+    transcripts enter exactly the same pipeline as pasted and uploaded notes.
+    """
+    name = provider.name
+    transcript = st.session_state.get(_skey(name, "transcript"))
+    if not isinstance(transcript, NormalizedTranscript):
+        return None
+
+    st.divider()
+    st.markdown("**Step 3 — review, then generate**")
+
+    columns = st.columns(3)
+    columns[0].metric(
+        "Characters", int(transcript.metadata.get("char_count") or len(transcript.raw_text))
+    )
+    columns[1].metric(
+        "Lines",
+        int(transcript.metadata.get("line_count") or len(transcript.raw_text.splitlines())),
+    )
+    columns[2].metric("Speakers named", len(transcript.participants))
+
+    if transcript.meeting_title:
+        st.write(f"**Meeting:** {transcript.meeting_title}")
+    if transcript.meeting_date:
+        st.write(f"**Date:** {transcript.meeting_date}")
+    if transcript.participants:
+        st.write("**Speakers:** " + ", ".join(transcript.participants))
+    else:
+        st.caption("No speaker names were provided by the source for this transcript.")
+
+    if transcript.metadata.get("truncation_warning"):
+        st.warning(transcript.metadata["truncation_warning"])
+    if transcript.metadata.get("speaker_attribution_note"):
+        st.info(transcript.metadata["speaker_attribution_note"])
+    if transcript.metadata.get("unresolved_participant_count"):
+        st.info(
+            "{} speaker(s) could not be named by the provider and appear as neutral "
+            "placeholders such as 'Speaker 1'.".format(
+                transcript.metadata["unresolved_participant_count"]
+            )
+        )
+
+    with st.expander("Preview transcript", expanded=True):
+        st.text_area(
+            "Transcript preview",
+            value=transcript.raw_text,
+            height=250,
+            disabled=True,
+            key=f"preview_{name}",
+        )
+
+    left, right = st.columns([2, 1])
+    with left:
+        generate = st.button(
+            "Generate BRD from this transcript", key=f"generate_{name}", type="primary"
+        )
+    with right:
+        if st.button("Clear loaded transcript", key=f"clear_{name}"):
+            st.session_state.pop(_skey(name, "transcript"), None)
+            st.rerun()
+
+    return transcript if generate else None
+
+
+def _render_provider_section(provider) -> Optional[NormalizedTranscript]:
+    """Full UI for one provider: configuration, auth, discovery, preview, generate."""
+    if not provider.is_configured():
+        st.warning("Status: **Provider Not Configured**")
+        missing = provider.get_missing_configuration()
+        if missing:
+            st.markdown(
+                "**Missing environment variables:** "
+                + ", ".join(f"`{item}`" for item in missing)
+            )
+            st.caption(
+                "Only variable names are listed. Set their values in your local `.env` file — "
+                "this app never displays, logs, or stores credential values."
+            )
+        with st.expander("View setup & configuration requirements", expanded=True):
+            st.markdown(provider.get_setup_instructions())
+        st.info("Manual Paste and Upload Transcript File keep working without this provider.")
+        return None
+
+    tokens = _connected_tokens(provider)
+    if tokens is None:
+        st.info(
+            f"{provider.display_name} is configured. Authorize read-only access to list and "
+            "retrieve your meeting transcripts."
+        )
+        _render_connect_button(provider)
+        return None
+
+    _render_connected_panel(provider, tokens)
+    st.divider()
+    _render_discovery_panel(provider, tokens)
+    _render_manual_fallback(provider, tokens)
+    return _render_loaded_transcript(provider)
+
+
 # --- Main Streamlit App ---
 
 st.title("Auto-BRD Generator")
@@ -448,34 +990,10 @@ st.write(
     "Convert raw meeting notes and transcripts into a structured Business Requirements Document."
 )
 
-# Check for OAuth redirects in query parameters
-query_params = st.query_params
-if "code" in query_params:
-    oauth_code = query_params.get("code")
-    oauth_state = query_params.get("state", "")
-    redirect_uri = os.getenv("APP_REDIRECT_URI", "http://localhost:8501")
-
-    if oauth_state == "google_meet":
-        meet_provider = GoogleMeetProvider()
-        try:
-            tokens = meet_provider.exchange_code_for_token(oauth_code, redirect_uri)
-            st.session_state["google_access_token"] = tokens.get("access_token")
-            st.session_state["google_refresh_token"] = tokens.get("refresh_token")
-            st.success("Successfully authenticated with Google Workspace!")
-        except Exception as e:
-            st.error(f"Google Authentication Error: {e}")
-        st.query_params.clear()
-
-    elif oauth_state == "microsoft_teams":
-        teams_provider = MSTeamsProvider()
-        try:
-            tokens = teams_provider.exchange_code_for_token(oauth_code, redirect_uri)
-            st.session_state["teams_access_token"] = tokens.get("access_token")
-            st.session_state["teams_refresh_token"] = tokens.get("refresh_token")
-            st.success("Successfully authenticated with Microsoft Teams!")
-        except Exception as e:
-            st.error(f"Microsoft Teams Authentication Error: {e}")
-        st.query_params.clear()
+# Handle OAuth redirects (denial, forged/expired state, or a verified code) before
+# anything else renders.
+_handle_oauth_callback()
+_render_flashes()
 
 # --- Transcript Source Selection ---
 source_option = st.radio(
@@ -490,7 +1008,6 @@ source_option = st.radio(
 )
 
 transcript_to_process: Optional[NormalizedTranscript] = None
-app_redirect_uri = os.getenv("APP_REDIRECT_URI", "http://localhost:8501")
 
 if source_option == "Manual Paste":
     meeting_notes = st.text_area(
@@ -539,97 +1056,15 @@ elif source_option == "Upload Transcript File (.txt)":
 
 elif source_option == "Google Meet":
     st.subheader("Google Meet Integration")
-    meet_provider = GoogleMeetProvider()
-
-    if not meet_provider.is_configured():
-        st.warning("Status: Provider Not Configured")
-        missing = meet_provider.get_missing_configuration()
-        if missing:
-            st.markdown(f"**Missing Configuration Variables:** `{', '.join(missing)}`")
-        with st.expander("View Setup & Configuration Requirements", expanded=True):
-            st.markdown(meet_provider.get_setup_instructions())
-    else:
-        st.success("Google Meet credentials detected in environment.")
-        google_token = st.session_state.get("google_access_token")
-
-        if not google_token:
-            auth_url = meet_provider.get_authorization_url(app_redirect_uri, state="google_meet")
-            st.info("Authenticate with your Google Workspace account to access meeting transcripts.")
-            st.link_button("Connect Google Workspace", auth_url, type="primary")
-        else:
-            st.write("Status: **Connected to Google Workspace**")
-            col_a, col_b = st.columns([3, 1])
-            with col_b:
-                if st.button("Disconnect Google", key="disconnect_google"):
-                    st.session_state.pop("google_access_token", None)
-                    st.session_state.pop("google_refresh_token", None)
-                    st.rerun()
-
-            meeting_id_input = st.text_input(
-                "Enter Google Meet Conference Record ID or Google Drive Transcript File ID",
-                placeholder="e.g. conferenceRecords/abc-xyz-123 or Google Drive Document ID",
-            )
-            if st.button("Fetch & Generate BRD", key="generate_google_meet"):
-                if not meeting_id_input.strip():
-                    st.error("Please enter a meeting or document ID.")
-                else:
-                    try:
-                        with st.spinner("Fetching transcript from Google Meet / Drive..."):
-                            transcript_to_process = meet_provider.get_transcript(
-                                meeting_id_input.strip(), access_token=google_token
-                            )
-                    except ProviderError as pe:
-                        st.error(f"Google Meet error: {pe}")
-                    except Exception as ex:
-                        st.error(f"Unexpected error retrieving Google transcript: {ex}")
+    transcript_to_process = _render_provider_section(GoogleMeetProvider())
 
 elif source_option == "Microsoft Teams":
     st.subheader("Microsoft Teams Integration")
-    teams_provider = MSTeamsProvider()
-
-    if not teams_provider.is_configured():
-        st.warning("Status: Provider Not Configured")
-        missing = teams_provider.get_missing_configuration()
-        if missing:
-            st.markdown(f"**Missing Configuration Variables:** `{', '.join(missing)}`")
-        with st.expander("View Setup & Configuration Requirements", expanded=True):
-            st.markdown(teams_provider.get_setup_instructions())
-    else:
-        st.success("Microsoft Teams credentials detected in environment.")
-        teams_token = st.session_state.get("teams_access_token")
-
-        if not teams_token:
-            auth_url = teams_provider.get_authorization_url(app_redirect_uri, state="microsoft_teams")
-            st.info("Authenticate with your Microsoft 365 account to access Teams transcripts.")
-            st.link_button("Connect Microsoft Teams", auth_url, type="primary")
-        else:
-            st.write("Status: **Connected to Microsoft Teams**")
-            col_a, col_b = st.columns([3, 1])
-            with col_b:
-                if st.button("Disconnect Teams", key="disconnect_teams"):
-                    st.session_state.pop("teams_access_token", None)
-                    st.session_state.pop("teams_refresh_token", None)
-                    st.rerun()
-
-            teams_id_input = st.text_input(
-                "Enter Teams Meeting ID or Transcript Resource Path",
-                placeholder="e.g. MSo0ZjQ.../transcripts/MS1lY2... or Online Meeting ID",
-            )
-            if st.button("Fetch & Generate BRD", key="generate_ms_teams"):
-                if not teams_id_input.strip():
-                    st.error("Please enter a Teams meeting or transcript ID.")
-                else:
-                    try:
-                        with st.spinner("Fetching transcript from Microsoft Graph..."):
-                            transcript_to_process = teams_provider.get_transcript(
-                                teams_id_input.strip(), access_token=teams_token
-                            )
-                    except ProviderError as pe:
-                        st.error(f"Microsoft Teams error: {pe}")
-                    except Exception as ex:
-                        st.error(f"Unexpected error retrieving Teams transcript: {ex}")
+    transcript_to_process = _render_provider_section(MSTeamsProvider())
 
 # --- Unified BRD Generation Pipeline ---
+# Manual paste, TXT upload, Google Meet and Microsoft Teams all converge here: one
+# NormalizedTranscript, one Gemini call, one evidence-validation pass, one export.
 if transcript_to_process:
     if not GEMINI_API_KEY:
         st.error("Gemini API key is not configured. Please set it in your .env file.")

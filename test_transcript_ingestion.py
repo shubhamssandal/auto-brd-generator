@@ -276,16 +276,41 @@ def test_ms_teams_refresh_token(monkeypatch):
 
 
 def test_ms_teams_list_transcripts(monkeypatch):
+    """
+    Discovery uses the supported delegated Graph flow:
+    /me/events -> onlineMeeting.joinUrl -> /me/onlineMeetings?$filter=JoinWebUrl eq '...'
+    -> /me/onlineMeetings/{id}/transcripts
+
+    (Graph v1.0 has no delegated 'list all online meetings' endpoint, so the meeting
+    must be resolved from the calendar event's join URL.)
+    """
     monkeypatch.setenv("AZURE_CLIENT_ID", "mock-azure-id")
     monkeypatch.setenv("AZURE_TENANT_ID", "mock-tenant-id")
     monkeypatch.setenv("AZURE_CLIENT_SECRET", "mock-azure-secret")
 
     provider = MSTeamsProvider()
 
-    class MockMeetingsResponse:
+    join_url = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0"
+
+    class MockEventsResponse:
         status_code = 200
         def json(self):
-            return {"value": [{"id": "meeting-1", "subject": "Architecture Sync"}]}
+            return {
+                "value": [
+                    {
+                        "id": "event-1",
+                        "subject": "Architecture Sync",
+                        "isOnlineMeeting": True,
+                        "onlineMeeting": {"joinUrl": join_url},
+                        "start": {"dateTime": "2026-08-21T10:00:00.0000000", "timeZone": "UTC"},
+                    }
+                ]
+            }
+
+    class MockOnlineMeetingLookupResponse:
+        status_code = 200
+        def json(self):
+            return {"value": [{"id": "meeting-1", "joinWebUrl": join_url}]}
 
     class MockTranscriptsResponse:
         status_code = 200
@@ -295,7 +320,9 @@ def test_ms_teams_list_transcripts(monkeypatch):
     def mock_get(url, *args, **kwargs):
         if "/transcripts" in url:
             return MockTranscriptsResponse()
-        return MockMeetingsResponse()
+        if "/onlineMeetings" in url:
+            return MockOnlineMeetingLookupResponse()
+        return MockEventsResponse()
 
     import requests
     monkeypatch.setattr(requests, "get", mock_get)
