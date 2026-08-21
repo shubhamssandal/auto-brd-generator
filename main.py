@@ -21,6 +21,7 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
+from jira_service import JiraService
 from providers import (
     GoogleMeetProvider,
     MSTeamsProvider,
@@ -467,6 +468,10 @@ def display_brd(brd_data: BRDData):
 PROVIDER_CLASSES = {
     "google_meet": GoogleMeetProvider,
     "microsoft_teams": MSTeamsProvider,
+    # Jira is not a transcript source, but it uses the same signed-state OAuth
+    # callback, so registering it here is what routes a verified `?code=` back
+    # to the right service.
+    "jira": JiraService,
 }
 
 
@@ -613,10 +618,12 @@ def _handle_oauth_callback() -> None:
         st.session_state[_skey(handshake.provider, "tokens")] = tokens
         st.session_state.pop(_skey(handshake.provider, "handshake"), None)
         st.session_state.pop(_skey(handshake.provider, "identity"), None)
-        message = (
-            f"Connected to {provider.display_name}. "
-            f"Select **{provider.display_name}** under Transcript Source to continue."
+        hint = getattr(
+            provider,
+            "post_connect_hint",
+            f"Select **{provider.display_name}** under Transcript Source to continue.",
         )
+        message = f"Connected to {provider.display_name}. {hint}"
         if not tokens.can_refresh():
             message += (
                 " Note: no refresh token was issued, so this session ends when the "
@@ -653,6 +660,14 @@ def _provider_call(provider, tokens: TokenSet, operation, spinner_text: str):
         return None
 
 
+# Shown under a Connect button unless the service overrides `connect_caption`.
+DEFAULT_CONNECT_CAPTION = (
+    "You will authorize read-only access on the provider's own sign-in page and be "
+    "returned here. The request carries a signed, single-use state value and a PKCE "
+    "challenge; your credentials are never seen by this app."
+)
+
+
 def _identity_label(provider, tokens: TokenSet) -> Optional[str]:
     """Best-effort 'signed in as' label. Never shows any token material."""
     key = _skey(provider.name, "identity")
@@ -676,7 +691,14 @@ def _identity_label(provider, tokens: TokenSet) -> Optional[str]:
 
 
 def _render_connect_button(provider) -> None:
-    """Render the authorization link, issuing a fresh signed state + PKCE pair."""
+    """
+    Render the authorization link, issuing a fresh signed state + PKCE pair.
+
+    The PKCE challenge is offered to every service; one that does not document
+    PKCE support simply ignores it and overrides ``connect_caption`` so the UI
+    does not claim a protection that was not used. The signed state is
+    unconditional.
+    """
     handshake_key = _skey(provider.name, "handshake")
     handshake = st.session_state.get(handshake_key)
     if not isinstance(handshake, OAuthHandshake) or handshake.is_stale():
@@ -695,11 +717,7 @@ def _render_connect_button(provider) -> None:
         return
 
     st.link_button(f"Connect {provider.display_name}", auth_url, type="primary")
-    st.caption(
-        "You will authorize read-only access on the provider's own sign-in page and be "
-        "returned here. The request carries a signed, single-use state value and a PKCE "
-        "challenge; your credentials are never seen by this app."
-    )
+    st.caption(getattr(provider, "connect_caption", DEFAULT_CONNECT_CAPTION))
 
 
 def _render_connected_panel(provider, tokens: TokenSet) -> None:
@@ -948,6 +966,56 @@ def _render_loaded_transcript(provider) -> Optional[NormalizedTranscript]:
     return transcript if generate else None
 
 
+def _render_jira_section() -> None:
+    """
+    The optional Jira Cloud connection.
+
+    Connection only: there is no site selection, no project selection, no work
+    plan and no issue creation here, so a connected session cannot change
+    anything in Jira. It renders regardless of whether a BRD exists, because the
+    OAuth redirect re-runs the script with no transcript in hand and the
+    connected state still has to be visible when the user returns.
+    """
+    service = JiraService()
+
+    st.divider()
+    st.subheader("Jira (optional)")
+
+    if not service.is_configured():
+        st.caption(
+            "Jira Cloud is not configured, so this step is skipped. Transcript ingestion "
+            "and BRD generation are unaffected."
+        )
+        missing = service.get_missing_configuration()
+        if missing:
+            st.markdown(
+                "**Missing environment variables:** "
+                + ", ".join(f"`{item}`" for item in missing)
+            )
+            st.caption(
+                "Only variable names are listed. Set their values in your local `.env` file — "
+                "this app never displays, logs, or stores credential values."
+            )
+        with st.expander("View Jira setup & configuration requirements"):
+            st.markdown(service.get_setup_instructions())
+        return
+
+    tokens = _connected_tokens(service)
+    if tokens is None:
+        st.caption(
+            "Connect a Jira Cloud account to use a generated BRD as the starting point for a "
+            "Jira work plan. Connecting by itself creates nothing in Jira."
+        )
+        _render_connect_button(service)
+        return
+
+    _render_connected_panel(service, tokens)
+    st.caption(
+        "Authorized to read your Atlassian identity only. Nothing has been created in Jira, "
+        "and no issue can be created without your explicit confirmation."
+    )
+
+
 def _render_provider_section(provider) -> Optional[NormalizedTranscript]:
     """Full UI for one provider: configuration, auth, discovery, preview, generate."""
     if not provider.is_configured():
@@ -1092,5 +1160,10 @@ if transcript_to_process:
             st.error("The response from the AI was not valid JSON. Please try again.")
         except Exception as e:
             st.error(f"An unexpected error occurred during BRD generation: {e}")
+
+# --- Optional Jira Connection ---
+# Rendered last, after the BRD, and entirely optional: a BRD-only user can ignore
+# it. Connection only -- nothing in this section can write to Jira.
+_render_jira_section()
 
 
