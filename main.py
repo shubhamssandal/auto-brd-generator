@@ -547,7 +547,7 @@ def _connected_tokens(provider) -> Optional[TokenSet]:
 
 def _disconnect(provider) -> None:
     """Drop every trace of the provider session from this browser session."""
-    for suffix in ("tokens", "handshake", "discovery", "transcript", "identity"):
+    for suffix in ("tokens", "handshake", "discovery", "transcript", "identity", "sites", "site"):
         st.session_state.pop(_skey(provider.name, suffix), None)
 
 
@@ -966,15 +966,93 @@ def _render_loaded_transcript(provider) -> Optional[NormalizedTranscript]:
     return transcript if generate else None
 
 
+def _render_jira_sites_panel(service, tokens: TokenSet) -> None:
+    """
+    Pick which Jira Cloud site to work with. Read-only.
+
+    Reuses ``_provider_call``, so the spinner, the single refresh-and-retry on an
+    expired token, and the authentication / authorization / API error messages are
+    the same ones the transcript providers already use. Only the chosen site's
+    non-secret identifiers are cached -- see ``JiraSite``.
+    """
+    sites_key = _skey(service.name, "sites")
+    site_key = _skey(service.name, "site")
+
+    st.markdown("**Step 1 — choose a Jira site**")
+    if st.button("Retrieve accessible Jira sites", key="discover_jira_sites"):
+        result = _provider_call(
+            service,
+            tokens,
+            lambda token: service.list_accessible_sites(access_token=token),
+            "Asking Atlassian which Jira sites this account can reach...",
+        )
+        if result is not None:
+            st.session_state[sites_key] = result
+            # A choice made against the previous list must not survive a re-query,
+            # and the picker's own state has to go too: the new list may be shorter.
+            st.session_state.pop(site_key, None)
+            st.session_state.pop("select_jira_site", None)
+
+    sites = st.session_state.get(sites_key)
+    if not isinstance(sites, list):
+        st.caption("Nothing has been requested from Jira yet. This only reads a list of sites.")
+        return
+
+    if not sites:
+        st.session_state.pop(site_key, None)
+        granted = tuple(tokens.public_summary().get("scopes") or ())
+        if granted and service.SITE_SCOPE not in granted:
+            st.warning(
+                "Atlassian returned no Jira sites, and this session was authorized without "
+                "the `{}` scope. That endpoint only reports sites the token holds a Jira "
+                "scope for, so this session cannot see any site regardless of what the "
+                "account owns. Disconnect and connect again to consent to the scope this "
+                "app now requests.".format(service.SITE_SCOPE)
+            )
+        else:
+            st.warning(
+                "This Atlassian account granted access to no Jira Cloud site. If you expected "
+                "one, check that you selected a site on Atlassian's consent screen — only the "
+                "sites chosen there are reported — then disconnect and connect again."
+            )
+        return
+
+    if len(sites) == 1:
+        site = sites[0]
+        st.caption("One accessible site was returned, so it is selected automatically.")
+    else:
+        indices = list(range(len(sites)))
+        chosen = st.selectbox(
+            "Jira sites accessible to this account ({} found)".format(len(sites)),
+            indices,
+            format_func=lambda i: sites[i].display_label,
+            key="select_jira_site",
+        )
+        site = sites[chosen]
+
+    st.session_state[site_key] = site
+    st.success("Selected Jira site: {}".format(site.display_label))
+
+    if site.scopes:
+        with st.expander("Scopes this authorization holds on the selected site"):
+            for scope in site.scopes:
+                st.write(f"- `{scope}`")
+        st.caption(
+            "Atlassian documents that this reflects the token's scopes, not your Jira "
+            "permissions, so it is not a promise about what you can see inside the site."
+        )
+
+
 def _render_jira_section() -> None:
     """
-    The optional Jira Cloud connection.
+    The optional Jira Cloud connection and site selection.
 
-    Connection only: there is no site selection, no project selection, no work
-    plan and no issue creation here, so a connected session cannot change
-    anything in Jira. It renders regardless of whether a BRD exists, because the
-    OAuth redirect re-runs the script with no transcript in hand and the
-    connected state still has to be visible when the user returns.
+    Read-only: it connects an account and lists the sites that account granted
+    access to. There is no project selection, no work plan and no issue creation
+    here, so a connected session cannot change anything in Jira. It renders
+    regardless of whether a BRD exists, because the OAuth redirect re-runs the
+    script with no transcript in hand and the connected state still has to be
+    visible when the user returns.
     """
     service = JiraService()
 
@@ -1010,9 +1088,11 @@ def _render_jira_section() -> None:
         return
 
     _render_connected_panel(service, tokens)
+    _render_jira_sites_panel(service, tokens)
     st.caption(
-        "Authorized to read your Atlassian identity only. Nothing has been created in Jira, "
-        "and no issue can be created without your explicit confirmation."
+        "Authorized to read your Atlassian identity and the Jira sites you granted. Nothing "
+        "has been created or changed in Jira, and no issue can be created without your "
+        "explicit confirmation."
     )
 
 

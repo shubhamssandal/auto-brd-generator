@@ -148,12 +148,14 @@ def test_authorization_url_requires_configuration():
 
 def test_requested_scopes_are_least_privilege():
     """
-    JIRA-002 connects an account; it does not read or write Jira. Asking for a
-    permission the app cannot yet exercise would misrepresent the consent screen.
+    Read-only throughout. `read:jira-user` is added in JIRA-003 because the
+    accessible-resources endpoint reports only sites the token holds a Jira scope
+    for; nothing broader is requested, since nothing in the app writes to Jira.
     """
-    assert set(JiraService.SCOPES) == {"read:me", "offline_access"}
+    assert set(JiraService.SCOPES) == {"read:me", "read:jira-user", "offline_access"}
     assert not [s for s in JiraService.SCOPES if s.startswith("write:")]
     assert not [s for s in JiraService.SCOPES if s.startswith("manage:")]
+    assert JiraService.SITE_SCOPE in JiraService.SCOPES
 
 
 def test_setup_instructions_name_the_required_scopes_but_no_values(configured):
@@ -658,16 +660,15 @@ def test_section_renders_the_connected_state(jira_callback, monkeypatch):
     assert "rt-secret-fake" not in rendered
 
 
-# --- JIRA-002 boundary ----------------------------------------------------
+# --- Write-action boundary ------------------------------------------------
 
-def test_service_cannot_reach_jira_or_create_anything_yet():
+def test_service_cannot_create_anything_yet():
     """
-    JIRA-002 is the connection only. Site discovery, project discovery, metadata
-    and issue creation arrive in later tickets, so none of them exist here.
+    The Jira integration is read-only so far. JIRA-003 adds site discovery
+    (`list_accessible_sites`); project discovery, metadata and issue creation
+    arrive in later tickets, so none of them exist here.
     """
     for absent in (
-        "get_accessible_resources",
-        "list_sites",
         "list_projects",
         "get_create_metadata",
         "create_issue",
