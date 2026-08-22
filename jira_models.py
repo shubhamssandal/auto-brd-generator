@@ -362,16 +362,19 @@ class PlannedIssue:
     acceptance_criteria: tuple = ()
     parent_plan_key: str = ""
     source_requirement_id: str = ""
+    selected: bool = True
 
 
 @dataclass(frozen=True)
 class JiraWorkPlan:
     """
-    A proposal for what could be created in one Jira project. Read-only.
+    A proposal for what could be created in one Jira project.
 
-    Held flat with parent references rather than as nested issues: it is the shape
-    creation needs later, since a parent has to exist before the child that names
-    it, and a flat tuple keeps that ordering explicit instead of implied by nesting.
+    Held locally and replaced as a whole when the reviewer edits it -- nothing here
+    is written to Jira. Held flat with parent references rather than as nested
+    issues: it is the shape creation needs later, since a parent has to exist
+    before the child that names it, and a flat tuple keeps that ordering explicit
+    instead of implied by nesting.
 
     ``notes`` is what the plan could not do and why -- an issue type the project
     does not offer, acceptance criteria that name no requirement, an action item

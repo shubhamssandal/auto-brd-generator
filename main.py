@@ -21,7 +21,14 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
-from jira_processor import build_work_plan
+from jira_processor import (
+    build_work_plan,
+    compatible_issue_types,
+    delete_planned_issue,
+    set_planned_issue_type,
+    update_planned_issue,
+    validate_work_plan,
+)
 from jira_service import JiraService
 from providers import (
     GoogleMeetProvider,
@@ -565,12 +572,25 @@ _JIRA_PROJECT_SUFFIXES = (
 # handled, the run that produced the BRD is over.
 BRD_SESSION_KEY = "brd_data"
 
+# Streamlit widget keys for the work-plan review editors. Not under ``jira__``:
+# those suffixes are plan data, and a leftover text-input value would otherwise
+# outlive the plan it described.
+_JIRA_REVIEW_WIDGET_PREFIX = "jira_review__"
+
+
+def _clear_jira_plan_review_widgets() -> None:
+    """Drop review-editor widget state so a new or absent plan cannot inherit it."""
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_JIRA_REVIEW_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
 
 def _disconnect(provider) -> None:
     """Drop every trace of the provider session from this browser session."""
     suffixes = ("tokens", "handshake", "discovery", "transcript", "identity", "sites", "site")
     for suffix in suffixes + _JIRA_PROJECT_SUFFIXES:
         st.session_state.pop(_skey(provider.name, suffix), None)
+    _clear_jira_plan_review_widgets()
 
 
 def _clear_jira_project_state(service) -> None:
@@ -583,6 +603,7 @@ def _clear_jira_project_state(service) -> None:
     for suffix in _JIRA_PROJECT_SUFFIXES:
         st.session_state.pop(_skey(service.name, suffix), None)
     st.session_state.pop("select_jira_project", None)
+    _clear_jira_plan_review_widgets()
 
 
 # Session-state namespace for Jira. Spelled once so the work-plan panel can address
@@ -607,6 +628,7 @@ def _store_brd(brd_data: BRDData) -> None:
     st.session_state[BRD_SESSION_KEY] = brd_data
     for suffix in ("plan", "plan_for"):
         st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
+    _clear_jira_plan_review_widgets()
 
 
 def _handle_oauth_callback() -> None:
@@ -1316,8 +1338,8 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     metadata above was read for, used to drop a plan that describes a different
     target.
 
-    Editing, selecting and creating are not here: those are later tickets. What this
-    renders is read-only.
+    Review edits stay in this browser session. Creating issues in Jira is a later,
+    explicit step: this panel still takes no service and no token.
     """
     plan_key = _skey(JIRA_STATE_NAME, "plan")
     plan_for_key = _skey(JIRA_STATE_NAME, "plan_for")
@@ -1337,8 +1359,10 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     if st.session_state.get(plan_for_key) not in (None, scope):
         st.session_state.pop(plan_key, None)
         st.session_state.pop(plan_for_key, None)
+        _clear_jira_plan_review_widgets()
 
     if st.button("Generate Jira Work Plan", key="generate_jira_work_plan"):
+        _clear_jira_plan_review_widgets()
         with st.spinner("Mapping BRD requirements onto this project's issue types..."):
             st.session_state[plan_key] = build_work_plan(brd_data, project, metadata)
         st.session_state[plan_for_key] = scope
@@ -1351,12 +1375,17 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
         )
         return
 
-    _render_work_plan(plan)
+    _render_work_plan(plan, metadata, project)
 
 
-def _render_work_plan(plan) -> None:
+def _persist_work_plan(plan):
+    st.session_state[_skey(JIRA_STATE_NAME, "plan")] = plan
+    return plan
+
+
+def _render_work_plan(plan, metadata, project=None) -> None:
     """
-    Show the proposal, parent above child.
+    Show the proposal, parent above child, and let the reviewer edit it.
 
     Issue types are named as Jira named them for this project. Nothing here is
     renamed into Epic/Story/Task: the levels shown are the ones the project reported.
@@ -1381,22 +1410,48 @@ def _render_work_plan(plan) -> None:
     )
 
     for root in plan.roots:
-        _render_planned_issue(plan, root, 0)
+        plan = _render_planned_issue(plan, root, 0, metadata)
+
+    for message in validate_work_plan(plan, metadata, project):
+        st.error(message)
 
     st.caption(
-        "A proposal only — nothing above exists in Jira. Editing, selecting which items "
-        "to keep, and creating them are separate, explicit steps that do not exist yet."
+        "A proposal only — nothing above exists in Jira. Edits, selection and deletion "
+        "stay in this session and do not create issues."
     )
 
 
-def _render_planned_issue(plan, issue, depth: int) -> None:
+def _criteria_text(criteria) -> str:
+    return "\n".join(str(item) for item in criteria if str(item).strip())
+
+
+def _criteria_from_text(text: str) -> tuple:
+    return tuple(line.strip() for line in str(text or "").splitlines() if line.strip())
+
+
+def _render_planned_issue(plan, issue, depth: int, metadata):
     """
     One proposed issue and, indented beneath it, whatever names it as parent.
 
     Indentation and the ``↳`` marker are what make the parent/child relationship
-    visible. The detail sits behind an expander per issue rather than nested
+    visible. Editors sit behind an expander per issue rather than nested
     expanders, which Streamlit does not allow.
     """
+    current = next((item for item in plan.issues if item.plan_key == issue.plan_key), None)
+    if current is None:
+        return plan
+    issue = current
+    widget = _JIRA_REVIEW_WIDGET_PREFIX + issue.plan_key + "__"
+
+    selected = st.checkbox(
+        "Include {}".format(issue.plan_key),
+        value=issue.selected,
+        key=widget + "selected",
+    )
+    if selected != issue.selected:
+        plan = _persist_work_plan(update_planned_issue(plan, issue.plan_key, selected=selected))
+        issue = next(item for item in plan.issues if item.plan_key == issue.plan_key)
+
     st.markdown(
         "{}{}`{}` **{}**".format(
             "&nbsp;" * (6 * depth),
@@ -1409,20 +1464,70 @@ def _render_planned_issue(plan, issue, depth: int) -> None:
     with st.expander("Details — {}".format(issue.plan_key)):
         if issue.hierarchy_level is not None:
             st.caption("Jira hierarchy level {} in this project.".format(issue.hierarchy_level))
-        if issue.description:
-            st.markdown(issue.description)
-        if issue.acceptance_criteria:
-            st.markdown("**Acceptance criteria**")
-            for criterion in issue.acceptance_criteria:
-                st.markdown("- {}".format(criterion))
-        elif issue.source_requirement_id:
+
+        summary = st.text_input(
+            "Summary",
+            value=issue.summary,
+            key=widget + "summary",
+        )
+        description = st.text_area(
+            "Description",
+            value=issue.description,
+            key=widget + "description",
+        )
+        criteria_value = st.text_area(
+            "Acceptance criteria (one per line)",
+            value=_criteria_text(issue.acceptance_criteria),
+            key=widget + "criteria",
+        )
+        criteria = _criteria_from_text(criteria_value)
+        if (
+            summary != issue.summary
+            or description != issue.description
+            or criteria != issue.acceptance_criteria
+        ):
+            plan = _persist_work_plan(
+                update_planned_issue(
+                    plan,
+                    issue.plan_key,
+                    summary=summary,
+                    description=description,
+                    acceptance_criteria=criteria,
+                )
+            )
+            issue = next(item for item in plan.issues if item.plan_key == issue.plan_key)
+
+        options = compatible_issue_types(issue, metadata)
+        if options and (len(options) > 1 or options[0].id != issue.issue_type_id):
+            type_ids = [item.id for item in options]
+            labels = {item.id: item.name or item.id for item in options}
+            current_id = issue.issue_type_id if issue.issue_type_id in type_ids else type_ids[0]
+            chosen_id = st.selectbox(
+                "Issue type",
+                type_ids,
+                index=type_ids.index(current_id),
+                format_func=lambda type_id: labels.get(type_id, type_id),
+                key=widget + "type",
+            )
+            if chosen_id != issue.issue_type_id:
+                chosen = next(item for item in options if item.id == chosen_id)
+                plan = _persist_work_plan(
+                    set_planned_issue_type(plan, issue.plan_key, chosen, metadata)
+                )
+                issue = next(item for item in plan.issues if item.plan_key == issue.plan_key)
+        elif issue.issue_type_name or issue.issue_type_id:
             st.caption(
-                "The BRD states no acceptance criterion naming this requirement, so none "
-                "is proposed here."
+                "Issue type: {}".format(issue.issue_type_name or issue.issue_type_id)
             )
 
+        if st.button("Delete this proposed issue", key=widget + "delete"):
+            plan = _persist_work_plan(delete_planned_issue(plan, issue.plan_key))
+            _clear_jira_plan_review_widgets()
+            st.rerun()
+
     for child in plan.children_of(issue.plan_key):
-        _render_planned_issue(plan, child, depth + 1)
+        plan = _render_planned_issue(plan, child, depth + 1, metadata)
+    return plan
 
 
 def _render_jira_section() -> None:
@@ -1433,8 +1538,9 @@ def _render_jira_section() -> None:
     Read-only throughout: it connects an account, lists the sites that account
     granted access to, lists the projects it can see on the chosen site, reads what
     creating an issue there would require, and proposes a plan from the reviewed BRD.
-    The plan is a proposal held in this browser session -- nothing in this section
-    writes to Jira, so a connected session cannot change anything there. It renders
+    The plan is a proposal held in this browser session -- review edits stay here
+    and nothing in this section writes to Jira, so a connected session cannot
+    change anything there. It renders
     regardless of whether a BRD exists, because the OAuth redirect re-runs the
     script with no transcript in hand and the connected state still has to be
     visible when the user returns.

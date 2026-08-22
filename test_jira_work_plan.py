@@ -122,7 +122,22 @@ def render_plan_panel(metadata, monkeypatch, project=PROJECT, scope=SCOPE, click
         monkeypatch.setattr(
             main.st, widget, lambda text, *a, _w=widget, **k: shown[_w].append(str(text))
         )
-    monkeypatch.setattr(main.st, "button", lambda label, **k: clicked)
+    monkeypatch.setattr(
+        main.st,
+        "button",
+        lambda label, **k: clicked if k.get("key") == "generate_jira_work_plan" else False,
+    )
+    monkeypatch.setattr(main.st, "checkbox", lambda label, **k: k.get("value", False))
+    monkeypatch.setattr(main.st, "text_input", lambda label, **k: k.get("value", ""))
+    monkeypatch.setattr(main.st, "text_area", lambda label, **k: k.get("value", ""))
+    monkeypatch.setattr(
+        main.st,
+        "selectbox",
+        lambda label, options=None, **k: (
+            options[k["index"]] if options and "index" in k else (options[0] if options else None)
+        ),
+    )
+    monkeypatch.setattr(main.st, "rerun", lambda: None)
 
     shown["expander"] = []
     real_expander = main.st.expander

@@ -6,7 +6,9 @@ this module imports no HTTP client and takes no access token, so generating a pl
 cannot create, change, or even read anything in Jira. ``TECHNICAL_ARCHITECTURE.md``
 puts that boundary plainly -- "Generating a plan must never create issues" -- and
 keeping the transformation in a module with no network access is how that is
-enforced rather than merely promised.
+enforced rather than merely promised. Review edits, deletion and validation live
+here too and inherit the same boundary: they replace a local plan object and never
+talk to Jira.
 
 Two rules shape the mapping.
 
@@ -37,6 +39,7 @@ without a live model.
 """
 
 import re
+from dataclasses import replace
 
 from brd_models import BRDData, Requirement
 from jira_models import (
@@ -411,3 +414,232 @@ def build_work_plan(
         issues=tuple(issues),
         notes=tuple(notes),
     )
+
+
+# Fields a reviewer may change on one proposed issue. Hierarchy identity -- plan key
+# and parent -- is not among them: those are structural, and a parent change would
+# be this module inventing a relationship. Type changes go through
+# ``set_planned_issue_type`` so a level cannot be swapped by passing a new id alone.
+_EDITABLE_ISSUE_FIELDS = frozenset(
+    {"summary", "description", "acceptance_criteria", "selected"}
+)
+
+
+def _issue_by_key(plan: JiraWorkPlan, plan_key: str):
+    for issue in plan.issues:
+        if issue.plan_key == plan_key:
+            return issue
+    return None
+
+
+def _with_issue(plan: JiraWorkPlan, updated: PlannedIssue) -> JiraWorkPlan:
+    return replace(
+        plan,
+        issues=tuple(
+            updated if issue.plan_key == updated.plan_key else issue
+            for issue in plan.issues
+        ),
+    )
+
+
+def _type_by_id(metadata: JiraProjectMetadata, type_id: str):
+    wanted = str(type_id or "")
+    for issue_type in metadata.issue_types:
+        if issue_type.id == wanted:
+            return issue_type
+    return None
+
+
+def _descendant_keys(plan: JiraWorkPlan, plan_key: str) -> set:
+    """``plan_key`` and every issue that names it as an ancestor, however deep."""
+    drop = {plan_key}
+    growing = True
+    while growing:
+        growing = False
+        for issue in plan.issues:
+            if issue.parent_plan_key in drop and issue.plan_key not in drop:
+                drop.add(issue.plan_key)
+                growing = True
+    return drop
+
+
+def update_planned_issue(plan: JiraWorkPlan, plan_key: str, **changes) -> JiraWorkPlan:
+    """
+    Replace editable fields on one proposed issue. Unknown keys are ignored.
+
+    Returns the original plan when ``plan_key`` is not in it, so a stale widget
+    cannot invent an issue.
+    """
+    issue = _issue_by_key(plan, plan_key)
+    if issue is None:
+        return plan
+    applied = {key: value for key, value in changes.items() if key in _EDITABLE_ISSUE_FIELDS}
+    if not applied:
+        return plan
+    return _with_issue(plan, replace(issue, **applied))
+
+
+def delete_planned_issue(plan: JiraWorkPlan, plan_key: str) -> JiraWorkPlan:
+    """
+    Remove one proposed issue and every descendant.
+
+    Cascade is required: a leftover child would name a parent that is no longer in
+    the plan, which is the orphaned-hierarchy case the review step must not leave
+    behind.
+    """
+    if _issue_by_key(plan, plan_key) is None:
+        return plan
+    drop = _descendant_keys(plan, plan_key)
+    return replace(
+        plan,
+        issues=tuple(issue for issue in plan.issues if issue.plan_key not in drop),
+    )
+
+
+def compatible_issue_types(issue: PlannedIssue, metadata: JiraProjectMetadata) -> tuple:
+    """
+    Plannable issue types that occupy the same place in this project's hierarchy.
+
+    Same ``hierarchy_level`` and same ``subtask`` flag as the type the issue already
+    carries. A project often lists Story, Task and Bug together at one level;
+    switching among those is the review-time choice ``FRONTEND_SPEC.md`` names.
+    Switching to a type at a different level -- or between a subtask type and a
+    standard type -- would move the issue in the hierarchy, which this step does
+    not do.
+
+    If the issue's current type is not in the metadata, nothing is compatible:
+    there is no reported flag to match against, and guessing one would invent
+    hierarchy.
+    """
+    current = _type_by_id(metadata, issue.issue_type_id)
+    if current is None:
+        return ()
+    return tuple(
+        issue_type
+        for issue_type in metadata.plannable_issue_types
+        if issue_type.subtask == current.subtask
+        and issue_type.hierarchy_level == current.hierarchy_level
+    )
+
+
+def set_planned_issue_type(plan: JiraWorkPlan, plan_key: str, issue_type, metadata) -> JiraWorkPlan:
+    """
+    Point one issue at a different type, only when that type is compatible.
+
+    Copies the type's id, name and reported hierarchy level. Refuses anything else
+    so a caller cannot promote or demote an issue by passing an arbitrary type.
+    """
+    issue = _issue_by_key(plan, plan_key)
+    if issue is None or issue_type is None:
+        return plan
+    allowed = {candidate.id for candidate in compatible_issue_types(issue, metadata)}
+    if issue_type.id not in allowed:
+        return plan
+    return _with_issue(
+        plan,
+        replace(
+            issue,
+            issue_type_id=issue_type.id,
+            issue_type_name=issue_type.name,
+            hierarchy_level=issue_type.hierarchy_level,
+        ),
+    )
+
+
+def _description_is_required(issue_type) -> bool:
+    """Whether Jira marked ``description`` required and does not default it."""
+    if issue_type is None:
+        return False
+    return any(
+        field.field_id == "description" and field.required and not field.has_default_value
+        for field in issue_type.required_fields
+    )
+
+
+def validate_work_plan(plan: JiraWorkPlan, metadata: JiraProjectMetadata, project=None) -> tuple:
+    """
+    Reasons this proposal is not ready. Empty means the selected issues are
+    internally consistent against the metadata on hand.
+
+    Creates nothing. The checks are the ones a later creation step would have to
+    trust: the project's own identifier, the issue types Jira reported, required
+    fields this app knows how to fill, and parent/child selection. Unknown extra
+    identifiers are not invented here.
+    """
+    errors: list = []
+    identifier = plan.project_identifier
+    read_for = metadata.project_identifier
+    if identifier and read_for and identifier != read_for:
+        errors.append(
+            "The issue types on hand were read for project '{}', not for '{}'.".format(
+                read_for, identifier
+            )
+        )
+        return tuple(errors)
+
+    if project is not None:
+        project_identifier = project.api_identifier
+        if identifier and project_identifier and identifier != project_identifier:
+            errors.append(
+                "This plan was built for project '{}', not for '{}'.".format(
+                    identifier, project_identifier
+                )
+            )
+            return tuple(errors)
+
+    by_key = {issue.plan_key: issue for issue in plan.issues}
+    selected = tuple(issue for issue in plan.issues if issue.selected)
+    if not selected:
+        errors.append("No issue is selected.")
+        return tuple(errors)
+
+    for issue in plan.issues:
+        if issue.parent_plan_key and issue.parent_plan_key not in by_key:
+            errors.append(
+                "{} names parent '{}', which is not in this plan.".format(
+                    issue.plan_key, issue.parent_plan_key
+                )
+            )
+
+    for issue in selected:
+        summary = issue.summary if isinstance(issue.summary, str) else ""
+        collapsed = summary.strip()
+        if not collapsed:
+            errors.append("{} has an empty summary.".format(issue.plan_key))
+        elif "\n" in summary or "\r" in summary:
+            errors.append("{} has a summary containing a line break.".format(issue.plan_key))
+        elif len(summary) > MAX_SUMMARY_LENGTH:
+            errors.append(
+                "{} has a summary longer than {} characters.".format(
+                    issue.plan_key, MAX_SUMMARY_LENGTH
+                )
+            )
+
+        issue_type = _type_by_id(metadata, issue.issue_type_id)
+        if issue_type is None or issue_type.validation_state != "ok":
+            errors.append(
+                "{} uses an unsupported issue type.".format(issue.plan_key)
+            )
+        else:
+            if issue_type.hierarchy_level != issue.hierarchy_level:
+                errors.append(
+                    "{} uses an issue type at a different hierarchy level than this "
+                    "issue occupies.".format(issue.plan_key)
+                )
+            if _description_is_required(issue_type) and not str(issue.description or "").strip():
+                errors.append("{} is missing a description.".format(issue.plan_key))
+            if issue_type.subtask and not issue.parent_plan_key:
+                errors.append(
+                    "{} is a subtask and has no parent.".format(issue.plan_key)
+                )
+
+        if issue.parent_plan_key:
+            parent = by_key.get(issue.parent_plan_key)
+            if parent is not None and not parent.selected:
+                errors.append(
+                    "{} is selected but its parent '{}' is not.".format(
+                        issue.plan_key, issue.parent_plan_key
+                    )
+                )
+
+    return tuple(errors)
