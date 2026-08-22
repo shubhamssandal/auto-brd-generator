@@ -328,3 +328,81 @@ class JiraProjectMetadata:
         """Issue types whose every required field a work plan could supply."""
         return tuple(t for t in self.issue_types if t.validation_state == "ok")
 
+
+# Jira rejects a summary longer than this, and rejects one containing a line break.
+# Enforced when a plan is built rather than checked later, so a plan cannot hold an
+# issue Jira would refuse on a field this app is the one filling in.
+MAX_SUMMARY_LENGTH = 255
+
+
+@dataclass(frozen=True)
+class PlannedIssue:
+    """
+    One issue a work plan proposes. Nothing here exists in Jira.
+
+    ``plan_key`` is this plan's own identifier for the issue -- a BRD requirement id
+    such as ``FR-1``, not a Jira issue key. Jira keys do not exist until something is
+    actually created, which no part of this ticket does; ``parent_plan_key`` therefore
+    refers to another ``PlannedIssue`` in the same plan, never to a Jira issue.
+
+    The issue type is carried as the id, name and hierarchy level Jira reported for
+    the selected project, so a plan is only ever expressed in that project's own
+    vocabulary. ``source_requirement_id`` keeps the line back to the BRD requirement
+    this restates, so a reviewer can check any proposed issue against what was
+    actually said. The verbatim transcript quote itself travels inside
+    ``description``, which is what would reach Jira, rather than being held twice.
+    """
+
+    plan_key: str
+    summary: str
+    issue_type_id: str = ""
+    issue_type_name: str = ""
+    hierarchy_level: Optional[int] = None
+    description: str = ""
+    acceptance_criteria: tuple = ()
+    parent_plan_key: str = ""
+    source_requirement_id: str = ""
+
+
+@dataclass(frozen=True)
+class JiraWorkPlan:
+    """
+    A proposal for what could be created in one Jira project. Read-only.
+
+    Held flat with parent references rather than as nested issues: it is the shape
+    creation needs later, since a parent has to exist before the child that names
+    it, and a flat tuple keeps that ordering explicit instead of implied by nesting.
+
+    ``notes`` is what the plan could not do and why -- an issue type the project
+    does not offer, acceptance criteria that name no requirement, an action item
+    with nowhere to hang. A BRD detail that could not be placed is reported here
+    rather than dropped.
+    """
+
+    project_identifier: str
+    project_label: str = ""
+    issues: tuple = ()
+    notes: tuple = ()
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.issues
+
+    @property
+    def roots(self) -> tuple:
+        """Issues with no parent, in plan order."""
+        return tuple(issue for issue in self.issues if not issue.parent_plan_key)
+
+    def children_of(self, plan_key: str) -> tuple:
+        """Issues naming ``plan_key`` as their parent, in plan order."""
+        return tuple(issue for issue in self.issues if issue.parent_plan_key == plan_key)
+
+    @property
+    def issue_type_names(self) -> tuple:
+        """The distinct Jira issue-type names this plan uses, in plan order."""
+        seen = []
+        for issue in self.issues:
+            if issue.issue_type_name and issue.issue_type_name not in seen:
+                seen.append(issue.issue_type_name)
+        return tuple(seen)
+

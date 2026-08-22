@@ -21,6 +21,7 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
+from jira_processor import build_work_plan
 from jira_service import JiraService
 from providers import (
     GoogleMeetProvider,
@@ -545,10 +546,24 @@ def _connected_tokens(provider) -> Optional[TokenSet]:
     return tokens if isinstance(tokens, TokenSet) else None
 
 
-# Session-state suffixes holding the Jira project selection and its create-metadata.
-# Named once because three separate events have to clear exactly this set: choosing
-# a different site, re-querying the project list, and disconnecting.
-_JIRA_PROJECT_SUFFIXES = ("projects", "projects_site", "project", "metadata", "metadata_for")
+# Session-state suffixes holding the Jira project selection, its create-metadata and
+# the work plan derived from them. Named once because three separate events have to
+# clear exactly this set: choosing a different site, re-querying the project list,
+# and disconnecting.
+_JIRA_PROJECT_SUFFIXES = (
+    "projects",
+    "projects_site",
+    "project",
+    "metadata",
+    "metadata_for",
+    "plan",
+    "plan_for",
+)
+
+# The reviewed BRD, kept so it survives the script re-run that every button click
+# causes. Without it a work plan could never be generated: by the time the click is
+# handled, the run that produced the BRD is over.
+BRD_SESSION_KEY = "brd_data"
 
 
 def _disconnect(provider) -> None:
@@ -568,6 +583,30 @@ def _clear_jira_project_state(service) -> None:
     for suffix in _JIRA_PROJECT_SUFFIXES:
         st.session_state.pop(_skey(service.name, suffix), None)
     st.session_state.pop("select_jira_project", None)
+
+
+# Session-state namespace for Jira. Spelled once so the work-plan panel can address
+# its own keys without being handed the service object: with no service and no token
+# in scope, that panel has no way to reach Jira at all.
+JIRA_STATE_NAME = JiraService().name
+
+
+def _store_brd(brd_data: BRDData) -> None:
+    """
+    Keep the generated BRD for the optional Jira step.
+
+    Required because every button click re-runs this script: by the time a
+    "Generate Jira Work Plan" click is handled, the run that produced the BRD is
+    over and its local variable is gone. Nothing else about BRD generation,
+    validation, display or export changes.
+
+    A plan built from the previous BRD is dropped rather than left behind. A work
+    plan is a proposal about one specific BRD, so a newly generated BRD makes a
+    cached plan wrong, not merely old.
+    """
+    st.session_state[BRD_SESSION_KEY] = brd_data
+    for suffix in ("plan", "plan_for"):
+        st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
 
 
 def _handle_oauth_callback() -> None:
@@ -1182,6 +1221,7 @@ def _render_jira_projects_panel(service, tokens: TokenSet, site) -> None:
         return
 
     _render_jira_project_metadata(metadata)
+    _render_jira_work_plan_panel(project, metadata, wanted)
 
 
 def _render_jira_project_metadata(metadata) -> None:
@@ -1266,15 +1306,135 @@ def _render_jira_project_metadata(metadata) -> None:
     )
 
 
+def _render_jira_work_plan_panel(project, metadata, scope) -> None:
+    """
+    Step 4: propose Jira issues from the reviewed BRD. Creates nothing.
+
+    Deliberately takes no service and no token. With neither in scope this panel has
+    no way to reach Jira, so "generating a plan creates nothing" is a property of the
+    code rather than a promise in a caption. ``scope`` is the (site, project) pair the
+    metadata above was read for, used to drop a plan that describes a different
+    target.
+
+    Editing, selecting and creating are not here: those are later tickets. What this
+    renders is read-only.
+    """
+    plan_key = _skey(JIRA_STATE_NAME, "plan")
+    plan_for_key = _skey(JIRA_STATE_NAME, "plan_for")
+
+    st.markdown("**Step 4 — generate a Jira work plan**")
+
+    brd_data = st.session_state.get(BRD_SESSION_KEY)
+    if not isinstance(brd_data, BRDData):
+        st.caption(
+            "No BRD is available yet. A work plan restates reviewed BRD requirements as "
+            "proposed Jira issues, so generate a BRD above first."
+        )
+        return
+
+    # A plan describes one BRD against one project's issue types. If the target moved,
+    # the cached plan is about something else.
+    if st.session_state.get(plan_for_key) not in (None, scope):
+        st.session_state.pop(plan_key, None)
+        st.session_state.pop(plan_for_key, None)
+
+    if st.button("Generate Jira Work Plan", key="generate_jira_work_plan"):
+        with st.spinner("Mapping BRD requirements onto this project's issue types..."):
+            st.session_state[plan_key] = build_work_plan(brd_data, project, metadata)
+        st.session_state[plan_for_key] = scope
+
+    plan = st.session_state.get(plan_key)
+    if plan is None:
+        st.caption(
+            "Not generated yet. This proposes issues from the BRD using only the issue "
+            "types checked above, and creates nothing in Jira."
+        )
+        return
+
+    _render_work_plan(plan)
+
+
+def _render_work_plan(plan) -> None:
+    """
+    Show the proposal, parent above child.
+
+    Issue types are named as Jira named them for this project. Nothing here is
+    renamed into Epic/Story/Task: the levels shown are the ones the project reported.
+    """
+    for note in plan.notes:
+        st.info(note)
+
+    if plan.is_empty:
+        st.warning(
+            "No issue could be proposed for this project. The notes above say why. "
+            "Nothing has been created in Jira."
+        )
+        return
+
+    st.success(
+        "Proposed {} issue(s) for {}, as {}. Nothing has been created in Jira.".format(
+            len(plan.issues),
+            plan.project_label or plan.project_identifier,
+            ", ".join("`{}`".format(name) for name in plan.issue_type_names)
+            or "the issue types checked above",
+        )
+    )
+
+    for root in plan.roots:
+        _render_planned_issue(plan, root, 0)
+
+    st.caption(
+        "A proposal only — nothing above exists in Jira. Editing, selecting which items "
+        "to keep, and creating them are separate, explicit steps that do not exist yet."
+    )
+
+
+def _render_planned_issue(plan, issue, depth: int) -> None:
+    """
+    One proposed issue and, indented beneath it, whatever names it as parent.
+
+    Indentation and the ``↳`` marker are what make the parent/child relationship
+    visible. The detail sits behind an expander per issue rather than nested
+    expanders, which Streamlit does not allow.
+    """
+    st.markdown(
+        "{}{}`{}` **{}**".format(
+            "&nbsp;" * (6 * depth),
+            "↳ " if depth else "",
+            issue.issue_type_name or issue.issue_type_id or "issue type not named",
+            issue.summary,
+        )
+    )
+
+    with st.expander("Details — {}".format(issue.plan_key)):
+        if issue.hierarchy_level is not None:
+            st.caption("Jira hierarchy level {} in this project.".format(issue.hierarchy_level))
+        if issue.description:
+            st.markdown(issue.description)
+        if issue.acceptance_criteria:
+            st.markdown("**Acceptance criteria**")
+            for criterion in issue.acceptance_criteria:
+                st.markdown("- {}".format(criterion))
+        elif issue.source_requirement_id:
+            st.caption(
+                "The BRD states no acceptance criterion naming this requirement, so none "
+                "is proposed here."
+            )
+
+    for child in plan.children_of(issue.plan_key):
+        _render_planned_issue(plan, child, depth + 1)
+
+
 def _render_jira_section() -> None:
     """
-    The optional Jira Cloud connection, site selection, project selection and
-    create-metadata check.
+    The optional Jira Cloud connection, site selection, project selection,
+    create-metadata check and proposed work plan.
 
     Read-only throughout: it connects an account, lists the sites that account
-    granted access to, lists the projects it can see on the chosen site, and reads
-    what creating an issue there would require. There is no work plan and no issue
-    creation here, so a connected session cannot change anything in Jira. It renders
+    granted access to, lists the projects it can see on the chosen site, reads what
+    creating an issue there would require, and proposes a plan from the reviewed BRD.
+    The plan is a proposal held in this browser session -- nothing in this section
+    writes to Jira, so a connected session cannot change anything there. It renders
     regardless of whether a BRD exists, because the OAuth redirect re-runs the
     script with no transcript in hand and the connected state still has to be
     visible when the user returns.
@@ -1334,9 +1494,9 @@ def _render_jira_section() -> None:
 
     st.caption(
         "Authorized to read your Atlassian identity, the Jira sites you granted, and the "
-        "projects and create-screen metadata on the site you select. Nothing has been "
-        "created or changed in Jira, and no issue can be created without your explicit "
-        "confirmation."
+        "projects and create-screen metadata on the site you select. A generated work plan "
+        "is a proposal held in this session only. Nothing has been created or changed in "
+        "Jira, and no issue can be created without your explicit confirmation."
     )
 
 
@@ -1466,6 +1626,9 @@ if transcript_to_process:
         try:
             with st.spinner("Analyzing transcript and generating BRD with Gemini..."):
                 brd_data = generate_brd_from_transcript(transcript_to_process)
+
+            # Kept for the optional Jira step below, which runs after a re-run.
+            _store_brd(brd_data)
 
             # --- Display the generated BRD ---
             display_brd(brd_data)
