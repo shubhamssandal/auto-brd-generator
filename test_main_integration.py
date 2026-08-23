@@ -8,10 +8,12 @@ credentials and no network access are required.
 """
 
 import pytest
+import requests
 import streamlit as st
 
 import main
 from brd_models import NormalizedTranscript
+from jira_processor import build_work_plan, validate_work_plan
 from providers.base import (
     ProviderAPIError,
     ProviderAuthenticationError,
@@ -21,7 +23,19 @@ from providers.base import (
 )
 from providers.oauth_state import begin_handshake
 from providers.session_tokens import TokenSet
+
+# JIRA-004/005's project and metadata builders, so the Jira half of this regression
+# runs against the same objects the Jira tests use rather than a shape invented here.
+from test_jira_work_plan import (
+    CONTAINER,
+    ITEM,
+    SUBTASK,
+    PROJECT as JIRA_PROJECT,
+    a_metadata,
+)
 from transcript_processor import normalize_manual_notes, normalize_uploaded_file
+
+JIRA_METADATA = a_metadata(CONTAINER, ITEM, SUBTASK)
 
 
 class StubProvider:
@@ -370,3 +384,64 @@ def test_stakeholder_roles_are_never_invented():
     assert roles["Priya"] == "Product Manager"
     assert roles["Sarah Khan"] == ""
     assert roles["Rahul Mehta"] is None
+
+
+# --- JIRA-009: every source still reaches a BRD, and a BRD still reaches Jira ---
+
+EVIDENCE = "Sarah Khan: Refund status takes two days to confirm."
+
+LLM_OUTPUT = {
+    "project_title": "Refund Visibility",
+    "functional_requirements": [
+        {
+            "requirement_id": "FR-1",
+            "statement": "The system shall show refund status within one hour.",
+            "source_evidence": EVIDENCE,
+        }
+    ],
+    "assumptions": [],
+}
+
+
+def a_transcript(source):
+    """The same meeting text arriving by each of the four supported routes."""
+    text = "{}\nPriya: We need it same day.".format(EVIDENCE)
+    if source == "manual":
+        return normalize_manual_notes(text, title="Refund Review")
+    if source == "upload":
+        return normalize_uploaded_file(text.encode(), filename="refund-review.txt")
+    return NormalizedTranscript(
+        raw_text=text,
+        source=source,
+        provider=source,
+        transcript_id="{}-transcript-1".format(source),
+        meeting_title="Refund Review",
+        participants=["Sarah Khan", "Priya"],
+    )
+
+
+@pytest.mark.parametrize(
+    "source", ["manual", "upload", "google_meet", "microsoft_teams"]
+)
+def test_every_transcript_source_reaches_a_brd_and_a_jira_work_plan(source, monkeypatch):
+    """
+    The regression this ticket exists for: the Jira layer added on top must not have
+    changed what any of the four sources produces, and a BRD from any of them must
+    still plan against a real project's hierarchy. Nothing here contacts a network --
+    the plan is a proposal, so no Jira call is involved in building one.
+    """
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: pytest.fail("planning must send no request")
+    )
+    transcript = a_transcript(source)
+    assert transcript.raw_text
+
+    brd = main.validate_and_create_brd_data(LLM_OUTPUT, transcript.raw_text)
+    assert [r.requirement_id for r in brd.functional_requirements] == ["FR-1"]
+
+    plan = build_work_plan(brd, JIRA_PROJECT, JIRA_METADATA)
+
+    assert not plan.is_empty
+    assert validate_work_plan(plan, JIRA_METADATA, JIRA_PROJECT) == ()
+    assert any("FR-1" in issue.requirement_ids for issue in plan.issues)
+    assert main._skey("jira", "created") not in st.session_state
