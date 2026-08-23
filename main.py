@@ -21,10 +21,13 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
+from jira_models import CreatedIssue
 from jira_processor import (
     build_work_plan,
     compatible_issue_types,
+    creation_order,
     delete_planned_issue,
+    issue_creation_payload,
     set_planned_issue_type,
     update_planned_issue,
     validate_work_plan,
@@ -46,6 +49,7 @@ from providers import (
     TranscriptUnavailableError,
     begin_handshake,
     call_with_refresh,
+    refresh_tokens,
     resolve_handshake,
 )
 
@@ -565,6 +569,13 @@ _JIRA_PROJECT_SUFFIXES = (
     "metadata_for",
     "plan",
     "plan_for",
+    # JIRA-007. "created" holds the per-issue outcome of a creation run and
+    # "creating" is the in-flight guard that stops a rerun from writing twice. Both
+    # belong to one plan against one target, so every path that drops a plan drops
+    # them too -- otherwise a fresh plan would inherit another plan's results.
+    "created",
+    "creating",
+    "confirm_create",
 )
 
 # The reviewed BRD, kept so it survives the script re-run that every button click
@@ -626,7 +637,7 @@ def _store_brd(brd_data: BRDData) -> None:
     cached plan wrong, not merely old.
     """
     st.session_state[BRD_SESSION_KEY] = brd_data
-    for suffix in ("plan", "plan_for"):
+    for suffix in ("plan", "plan_for", "created", "creating", "confirm_create"):
         st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
     _clear_jira_plan_review_widgets()
 
@@ -1244,6 +1255,7 @@ def _render_jira_projects_panel(service, tokens: TokenSet, site) -> None:
 
     _render_jira_project_metadata(metadata)
     _render_jira_work_plan_panel(project, metadata, wanted)
+    _render_jira_creation_panel(service, tokens, site, project, metadata)
 
 
 def _render_jira_project_metadata(metadata) -> None:
@@ -1357,12 +1369,16 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     # A plan describes one BRD against one project's issue types. If the target moved,
     # the cached plan is about something else.
     if st.session_state.get(plan_for_key) not in (None, scope):
-        st.session_state.pop(plan_key, None)
-        st.session_state.pop(plan_for_key, None)
+        for suffix in ("plan", "plan_for", "created", "creating", "confirm_create"):
+            st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         _clear_jira_plan_review_widgets()
 
     if st.button("Generate Jira Work Plan", key="generate_jira_work_plan"):
         _clear_jira_plan_review_widgets()
+        # A regenerated plan is a different proposal, so a previous run's results and
+        # its in-flight guard must not carry over onto it.
+        for suffix in ("created", "creating", "confirm_create"):
+            st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         with st.spinner("Mapping BRD requirements onto this project's issue types..."):
             st.session_state[plan_key] = build_work_plan(brd_data, project, metadata)
         st.session_state[plan_for_key] = scope
@@ -1530,17 +1546,221 @@ def _render_planned_issue(plan, issue, depth: int, metadata):
     return plan
 
 
+def _render_created_results(created) -> None:
+    """
+    What a creation run actually did, successes and failures kept apart.
+
+    Rendered from stored results rather than from the run itself, so the outcome
+    survives the reruns that follow it and a partial failure stays visible instead of
+    vanishing on the next click.
+    """
+    succeeded = [record for record in created if record.succeeded]
+    failed = [record for record in created if not record.succeeded]
+
+    if succeeded:
+        st.success("Created {} issue(s) in Jira.".format(len(succeeded)))
+        for record in succeeded:
+            st.write("- `{}` — created as **{}**".format(record.plan_key, record.issue_key))
+    if failed:
+        st.error(
+            "{} issue(s) were not created. The successes above were still created and "
+            "are listed by their Jira key.".format(len(failed))
+        )
+        for record in failed:
+            st.write("- `{}` — not created: {}".format(record.plan_key, record.error))
+        st.caption(
+            "Nothing is retried automatically: a create cannot be repeated safely without "
+            "risking a duplicate. Deselect what already exists in Jira before trying again."
+        )
+
+
+def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
+    """
+    Create the selected issues, parents first, and report each outcome.
+
+    Stops at the first failure. Continuing would create children whose parent is
+    missing, and a run that half-built a hierarchy is harder to clean up than one that
+    stopped where it broke.
+
+    The token is refreshed *before* the run rather than in reaction to a 401, so no
+    create is ever re-sent: ``JiraService.create_issue`` raises an authentication error
+    on 401 instead of the expiry error ``call_with_refresh`` would retry.
+    """
+    created: list = []
+    keys_by_plan_key: dict = {}
+
+    if tokens.is_expired() and tokens.can_refresh():
+        try:
+            tokens = refresh_tokens(service, tokens)
+            st.session_state[_skey(service.name, "tokens")] = tokens
+        except Exception as e:
+            _report_provider_error(service.display_name, e)
+            return ()
+
+    for issue in creation_order(plan):
+        parent_key = keys_by_plan_key.get(issue.parent_plan_key, "")
+        payload = issue_creation_payload(issue, project.api_identifier, parent_key)
+        try:
+            body = service.create_issue(
+                access_token=tokens.access_token,
+                cloud_id=cloud_id,
+                payload=payload,
+            )
+        except Exception as e:
+            created.append(CreatedIssue(plan_key=issue.plan_key, error=str(e)))
+            break
+
+        record = CreatedIssue(
+            plan_key=issue.plan_key,
+            issue_key=str(body.get("key") or ""),
+            issue_id=str(body.get("id") or ""),
+        )
+        created.append(record)
+        if record.issue_key:
+            keys_by_plan_key[issue.plan_key] = record.issue_key
+
+    return tuple(created)
+
+
+def _render_jira_creation_panel(service, tokens, site, project, metadata) -> None:
+    """
+    Step 5: create the selected issues, after an explicit confirmation.
+
+    Two deliberate properties. Nothing is created on a page load or a rerun -- a write
+    happens only in the branch a confirm button was pressed in. And a run is guarded by
+    a stored flag, so a double-click or a rerun mid-run cannot start a second one.
+    """
+    plan = st.session_state.get(_skey(JIRA_STATE_NAME, "plan"))
+    created_key = _skey(JIRA_STATE_NAME, "created")
+    creating_key = _skey(JIRA_STATE_NAME, "creating")
+    confirm_key = _skey(JIRA_STATE_NAME, "confirm_create")
+
+    created = st.session_state.get(created_key)
+    if created:
+        st.markdown("**Step 5 — create the selected issues**")
+        _render_created_results(created)
+        return
+
+    if plan is None or plan.is_empty:
+        return
+
+    st.markdown("**Step 5 — create the selected issues**")
+
+    # A session authorized before the write scope existed cannot create anything, and a
+    # refresh cannot widen a grant. Checked before anything is offered, so this is one
+    # sentence here rather than a 403 partway through a run. An empty scope list is not
+    # evidence of absence: some token responses omit `scope` entirely.
+    granted = tokens.public_summary().get("scopes")
+    if granted and service.WRITE_SCOPE not in granted:
+        st.warning(
+            "This Jira session was authorized without `{}`, so it cannot create issues. "
+            "Disconnect and connect again to grant it. Nothing has been created.".format(
+                service.WRITE_SCOPE
+            )
+        )
+        return
+
+    problems = validate_work_plan(plan, metadata, project)
+    if problems:
+        st.warning(
+            "This plan cannot be created yet. Fix the {} problem(s) listed above "
+            "first.".format(len(problems))
+        )
+        return
+
+    ordered = creation_order(plan)
+    selected = [issue for issue in plan.issues if issue.selected]
+    if not ordered:
+        # Two causes reach here: nothing is selected, and no selected issue can be
+        # placed after its parent. Neither is named, because asserting the wrong one is
+        # worse than reporting that there is nothing this plan can create.
+        st.warning(
+            "Nothing can be created from this plan: either no issue is selected, or a "
+            "parent relationship could not be resolved into a creation order."
+        )
+        return
+
+    if len(ordered) < len(selected):
+        # An omission has to be stated before the confirmation, not discovered from a
+        # result list that is shorter than the plan.
+        placed = {issue.plan_key for issue in ordered}
+        st.warning(
+            "{} selected issue(s) cannot be placed after their parent and will not be "
+            "created: {}.".format(
+                len(selected) - len(ordered),
+                ", ".join(
+                    issue.plan_key for issue in selected if issue.plan_key not in placed
+                ),
+            )
+        )
+
+    st.write(
+        "**{} issue(s)** would be created in **{}**, as {}.".format(
+            len(ordered),
+            project.display_label,
+            ", ".join(
+                "`{}`".format(name)
+                for name in dict.fromkeys(
+                    issue.issue_type_name or issue.issue_type_id for issue in ordered
+                )
+            ),
+        )
+    )
+    st.caption(
+        "Parents are created before the children that name them. This writes to Jira and "
+        "cannot be undone from here — nothing is retried automatically, because repeating "
+        "a create risks a duplicate issue."
+    )
+
+    if not st.session_state.get(confirm_key):
+        if st.button("Create Selected Issues in Jira", key="request_jira_creation"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning(
+        "Confirm: create {} issue(s) in {}. This cannot be undone from this app.".format(
+            len(ordered), project.display_label
+        )
+    )
+    confirmed = st.button("Yes — create them now", key="confirm_jira_creation")
+    if st.button("Cancel", key="cancel_jira_creation"):
+        st.session_state.pop(confirm_key, None)
+        st.rerun()
+        return
+
+    if not confirmed:
+        return
+
+    # The guard is stored before the first request and cleared only after the run, so a
+    # rerun that arrives mid-run finds it set and does not start a second run.
+    if st.session_state.get(creating_key):
+        st.info("A creation run is already in progress.")
+        return
+    st.session_state[creating_key] = True
+    try:
+        with st.spinner("Creating {} issue(s) in Jira...".format(len(ordered))):
+            results = _create_selected_issues(service, tokens, site.id, project, plan)
+    finally:
+        st.session_state.pop(creating_key, None)
+        st.session_state.pop(confirm_key, None)
+
+    if results:
+        st.session_state[created_key] = results
+    _render_created_results(results or ())
+
+
 def _render_jira_section() -> None:
     """
     The optional Jira Cloud connection, site selection, project selection,
-    create-metadata check and proposed work plan.
+    create-metadata check, proposed work plan and issue creation.
 
-    Read-only throughout: it connects an account, lists the sites that account
+    Read-only up to the plan: it connects an account, lists the sites that account
     granted access to, lists the projects it can see on the chosen site, reads what
     creating an issue there would require, and proposes a plan from the reviewed BRD.
-    The plan is a proposal held in this browser session -- review edits stay here
-    and nothing in this section writes to Jira, so a connected session cannot
-    change anything there. It renders
+    The plan is a proposal held in this browser session, and review edits stay here.
+    The one write is issue creation, which happens only after an explicit
+    confirmation in step 5 and never on a page load or a rerun. This section renders
     regardless of whether a BRD exists, because the OAuth redirect re-runs the
     script with no transcript in hand and the connected state still has to be
     visible when the user returns.
@@ -1585,11 +1805,19 @@ def _render_jira_section() -> None:
     # guess whether it was scopes or Jira permissions.
     stale = service.missing_scopes(tokens.public_summary().get("scopes"))
     if stale:
+        # Only the last step needs the write scope, so a session missing just that one
+        # can still read, plan and review. Telling such a user that everything below
+        # fails would be false and would push them into a reconnect they may not need.
+        consequence = (
+            "the steps below will fail"
+            if [scope for scope in stale if scope != service.WRITE_SCOPE]
+            else "reading and planning still work, but no issue can be created"
+        )
         st.warning(
             "This Jira session was authorized before the app requested "
             + ", ".join("`{}`".format(scope) for scope in stale)
             + ". Atlassian grants scopes at consent time and a token refresh cannot add "
-            "one, so the steps below will fail until you disconnect and connect again."
+            "one, so {} until you disconnect and connect again.".format(consequence)
         )
 
     _render_jira_sites_panel(service, tokens)
@@ -1756,7 +1984,7 @@ if transcript_to_process:
 
 # --- Optional Jira Connection ---
 # Rendered last, after the BRD, and entirely optional: a BRD-only user can ignore
-# it. Connection only -- nothing in this section can write to Jira.
+# it. The only write is issue creation, which requires an explicit confirmation.
 _render_jira_section()
 
 

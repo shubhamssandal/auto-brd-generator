@@ -148,23 +148,27 @@ def test_authorization_url_requires_configuration():
 
 def test_requested_scopes_are_least_privilege():
     """
-    Read-only throughout. `read:jira-user` was added in JIRA-003 because the
-    accessible-resources endpoint reports only sites the token holds a Jira scope
-    for; `read:jira-work` is added in JIRA-004 because reading projects and their
-    create-screen metadata is project and issue data, which `read:jira-user`
-    ("user information in Jira") does not cover. Nothing broader is requested,
-    since nothing in the app writes to Jira.
+    Read-only except for the one thing the app creates. `read:jira-user` was added in
+    JIRA-003 because the accessible-resources endpoint reports only sites the token
+    holds a Jira scope for; `read:jira-work` is added in JIRA-004 because reading
+    projects and their create-screen metadata is project and issue data, which
+    `read:jira-user` ("user information in Jira") does not cover; `write:jira-work` is
+    added in JIRA-007, which creates the reviewed issues. Nothing broader is requested
+    -- no `manage:` scope, and nothing that could administer a site.
     """
     assert set(JiraService.SCOPES) == {
         "read:me",
         "read:jira-user",
         "read:jira-work",
+        "write:jira-work",
         "offline_access",
     }
-    assert not [s for s in JiraService.SCOPES if s.startswith("write:")]
-    assert not [s for s in JiraService.SCOPES if s.startswith("manage:")]
+    # One write scope, and it is the narrowest one that can create an issue.
+    assert [s for s in JiraService.SCOPES if s.startswith("write:")] == ["write:jira-work"]
+    assert not [s for s in JiraService.SCOPES if s.startswith(("manage:", "delete:"))]
     assert JiraService.SITE_SCOPE in JiraService.SCOPES
     assert JiraService.PROJECT_SCOPE in JiraService.SCOPES
+    assert JiraService.WRITE_SCOPE in JiraService.SCOPES
 
 
 def test_setup_instructions_name_the_required_scopes_but_no_values(configured):
@@ -671,22 +675,26 @@ def test_section_renders_the_connected_state(jira_callback, monkeypatch):
 
 # --- Write-action boundary ------------------------------------------------
 
-def test_service_cannot_create_anything_yet():
+def test_the_write_surface_is_exactly_one_method():
     """
-    The Jira integration is read-only. JIRA-003 added site discovery and JIRA-004
-    adds project and create-metadata discovery -- all GETs. Issue creation arrives
-    in a later ticket, so no write entry point exists here.
+    JIRA-007 adds issue creation, and nothing else. Everything the app never asked for
+    -- bulk creation, project creation, editing or deleting an existing issue -- stays
+    absent, so the write surface is one reviewable method rather than a general-purpose
+    Jira client.
     """
+    assert hasattr(JiraService, "create_issue")
     for absent in (
-        "create_issue",
         "create_issues",
         "create_project",
         "update_issue",
+        "edit_issue",
         "delete_issue",
+        "delete_project",
+        "transition_issue",
     ):
         assert not hasattr(JiraService, absent), absent
 
-    # The read-only discovery surface, by contrast, is expected to be present.
+    # The read-only discovery surface is expected to be present.
     for present in ("list_accessible_sites", "list_projects", "get_project_metadata"):
         assert hasattr(JiraService, present), present
 

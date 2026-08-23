@@ -366,6 +366,31 @@ class PlannedIssue:
 
 
 @dataclass(frozen=True)
+class CreatedIssue:
+    """
+    One issue creation that was attempted in Jira, and how it turned out.
+
+    ``plan_key`` ties the outcome back to the ``PlannedIssue`` it came from, which is
+    what lets a partial failure be reported per proposed issue rather than as one
+    aggregate count.
+
+    ``issue_key`` and ``issue_id`` are what Jira returned and exist only on success;
+    ``error`` carries the reason on failure. Exactly one of the two is populated, so
+    ``succeeded`` is a fact about the record rather than a separate flag that could
+    disagree with it.
+    """
+
+    plan_key: str
+    issue_key: str = ""
+    issue_id: str = ""
+    error: str = ""
+
+    @property
+    def succeeded(self) -> bool:
+        return bool(self.issue_key or self.issue_id)
+
+
+@dataclass(frozen=True)
 class JiraWorkPlan:
     """
     A proposal for what could be created in one Jira project.

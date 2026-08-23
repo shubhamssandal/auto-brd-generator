@@ -48,7 +48,7 @@ from test_jira_sites import (  # noqa: F401 -- fixtures are used by pytest, not 
 
 # The scope set this app now requests. `tokens_for` still defaults to the narrower
 # JIRA-003 grant, which is what the missing-scope tests below need.
-FULL_SCOPES = "read:me read:jira-user read:jira-work offline_access"
+FULL_SCOPES = "read:me read:jira-user read:jira-work write:jira-work offline_access"
 
 SITE = JiraSite.from_api(SITE_A)
 OTHER_SITE = JiraSite.from_api(SITE_B)
@@ -765,8 +765,16 @@ def test_disconnect_clears_every_project_and_metadata_key(configured):
     "granted,expected",
     [
         (FULL_SCOPES.split(), []),
-        # A session authorized under JIRA-003 keeps the narrower grant.
-        (["read:me", "read:jira-user", "offline_access"], ["read:jira-work"]),
+        # A session authorized under JIRA-003 keeps the narrower grant, and is now
+        # short both the project scope and the write scope JIRA-007 added.
+        (
+            ["read:me", "read:jira-user", "offline_access"],
+            ["read:jira-work", "write:jira-work"],
+        ),
+        # A session authorized before JIRA-007 can still read and plan; only creation
+        # is out of reach, which is what the panel says rather than "reconnect now".
+        (["read:me", "read:jira-user", "read:jira-work", "offline_access"],
+         ["write:jira-work"]),
         # Silence is not evidence: a provider that omits `scope` must not be told
         # to reconnect.
         ((), []),

@@ -643,3 +643,108 @@ def validate_work_plan(plan: JiraWorkPlan, metadata: JiraProjectMetadata, projec
                 )
 
     return tuple(errors)
+
+
+def creation_order(plan: JiraWorkPlan) -> tuple:
+    """
+    The selected issues, parents before the children that name them.
+
+    Jira cannot be told about a parent that does not exist yet, so ordering is a
+    correctness requirement of creation rather than a presentation choice. A plan is
+    already stored parent-first, but an edit or a deletion can leave a child earlier
+    in the tuple than its parent, so the order is derived here instead of trusted.
+
+    A selected issue whose parent is not being created is left out: creating it would
+    silently drop the relationship the plan states. ``validate_work_plan`` reports
+    that case as an error, so a validated plan loses nothing here.
+    """
+    selected = [issue for issue in plan.issues if issue.selected]
+    available = {issue.plan_key for issue in selected}
+
+    ordered: list = []
+    placed: set = set()
+    remaining = list(selected)
+    while remaining:
+        ready = [
+            issue
+            for issue in remaining
+            if not issue.parent_plan_key
+            or issue.parent_plan_key not in available
+            or issue.parent_plan_key in placed
+        ]
+        if not ready:
+            # Only reachable if the plan holds a parent cycle, which nothing builds.
+            # Stopping is right: emitting the rest in arbitrary order would create
+            # issues whose parents were never created.
+            break
+        for issue in ready:
+            # A child whose parent is not being created is dropped, not reparented.
+            if issue.parent_plan_key and issue.parent_plan_key not in available:
+                placed.add(issue.plan_key)
+                remaining.remove(issue)
+                continue
+            ordered.append(issue)
+            placed.add(issue.plan_key)
+            remaining.remove(issue)
+    return tuple(ordered)
+
+
+def _adf(text: str) -> dict:
+    """
+    Plain text as an Atlassian Document Format doc.
+
+    VERIFICATION NOTE. Jira Cloud platform REST API **v3** takes rich-text fields
+    (``description``) as ADF rather than as a string; v2 takes a string. That
+    difference is why this exists, and it could not be confirmed against Atlassian's
+    reference in this environment -- see ``JiraService.CREATE_ISSUE_PATH``. Each
+    blank-line-separated block becomes one paragraph; the text is not parsed as
+    Markdown, so a heading or bullet from the plan reaches Jira as literal text
+    rather than as invented formatting.
+    """
+    blocks = [block.strip() for block in str(text or "").split("\n\n") if block.strip()]
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": block}]}
+            for block in blocks
+        ],
+    }
+
+
+def issue_creation_payload(
+    issue: PlannedIssue,
+    project_id_or_key: str,
+    parent_issue_key: str = "",
+) -> dict:
+    """
+    The request body for creating one proposed issue. Sends nothing itself.
+
+    ``parent_issue_key`` is the *Jira* key the parent was actually created as, which
+    only the caller can know, so it is passed in rather than read off the plan: the
+    plan holds plan-local keys, and sending one of those as a parent would name an
+    issue that does not exist in Jira.
+
+    Acceptance criteria travel inside the description. They have no field of their own
+    on a Jira create screen -- a project that tracks them separately does it with a
+    custom field, and writing to a field this app did not discover would be inventing
+    one.
+    """
+    description = str(issue.description or "")
+    criteria = [str(item).strip() for item in issue.acceptance_criteria if str(item).strip()]
+    if criteria:
+        description = "\n\n".join(
+            [description.strip(), "Acceptance criteria:"] + ["- {}".format(c) for c in criteria]
+        ).strip()
+
+    fields: dict = {
+        "project": {"id" if str(project_id_or_key).isdigit() else "key": str(project_id_or_key)},
+        "issuetype": {"id": issue.issue_type_id},
+        "summary": issue.summary,
+    }
+    if description.strip():
+        fields["description"] = _adf(description)
+    if parent_issue_key:
+        fields["parent"] = {"key": parent_issue_key}
+
+    return {"fields": fields}

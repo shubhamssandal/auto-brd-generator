@@ -85,14 +85,24 @@ class JiraService:
     # scope (write:jira-work) and is not requested.
     PROJECT_SCOPE = "read:jira-work"
 
+    # Creating issues is the one write this app performs, and it needs the write
+    # counterpart of PROJECT_SCOPE. Atlassian describes write:jira-work as "Create
+    # and edit issues in Jira, post comments, create worklogs, and delete issues".
+    # That is broader than this app uses -- it only ever POSTs new issues -- but
+    # Atlassian does not publish a narrower classic scope for creation alone, and the
+    # classic scopes are what its reference recommends over the granular equivalents.
+    # Requested only because JIRA-007 creates issues on explicit confirmation.
+    WRITE_SCOPE = "write:jira-work"
+
     # Least privilege for this ticket: the connected account's identity so the UI
     # can say who is signed in, two read-only Jira scopes so accessible sites,
-    # projects and create-metadata can be read, and a refresh token. Nothing here
-    # can write to Jira.
+    # projects and create-metadata can be read, the write scope that issue creation
+    # requires, and a refresh token.
     SCOPES = [
         "read:me",
         SITE_SCOPE,
         PROJECT_SCOPE,
+        WRITE_SCOPE,
         "offline_access",
     ]
 
@@ -116,6 +126,14 @@ class JiraService:
     PROJECT_SEARCH_PATH = "/rest/api/3/project/search"
     ISSUE_TYPES_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes"
     ISSUE_TYPE_FIELDS_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes/{issue_type}"
+
+    # The only write path in this app. Same verification caveat as the read paths
+    # above: it is the documented Jira Cloud platform v3 create-issue route as
+    # understood here, but the reference page could not be fetched in this
+    # environment, so treat the path, the 201 success code and the ADF-shaped
+    # `description` as unconfirmed until a live call or a browser check settles them.
+    # A live smoke test is the intended confirmation.
+    CREATE_ISSUE_PATH = "/rest/api/3/issue"
 
     # Bounded pagination, matching the Google and Microsoft providers. The cap is a
     # backstop against a server that ignores startAt; hitting it is reported rather
@@ -746,4 +764,78 @@ class JiraService:
             issue_types=tuple(issue_types),
             notes=tuple(notes),
             truncated=truncated,
+        )
+
+    # --- The one write ------------------------------------------------------
+
+    def create_issue(self, access_token: str, cloud_id: str, payload: dict) -> dict[str, Any]:
+        """
+        POST one issue to Jira. The only call in this app that changes anything.
+
+        ``payload`` is built by ``jira_processor.issue_creation_payload`` -- this
+        method neither composes nor edits it, so what reaches Jira is what the
+        reviewer approved.
+
+        **Never retried here.** A create is not idempotent and Jira offers no
+        idempotency key on this endpoint, so a retry after an ambiguous answer could
+        produce a second issue. A 401 is therefore reported as an authentication
+        failure rather than raised as ``ProviderTokenExpiredError``: that exception is
+        what ``call_with_refresh`` reacts to by re-running the operation, which for a
+        create could duplicate an issue the first attempt already made. Refreshing an
+        expired token *before* the write is the caller's job.
+
+        A network error is likewise not retried, and is reported as unresolved: the
+        request may well have reached Jira, so the honest answer is that the outcome
+        is unknown rather than that it failed.
+        """
+        url = self.site_api_url(cloud_id, self.CREATE_ISSUE_PATH)
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Authorization": "Bearer {}".format(access_token),
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self.TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as e:
+            raise ProviderAPIError(
+                "Network error while creating the issue in Jira, so it is unknown whether "
+                "it was created. Check Jira before trying again: {}".format(e)
+            )
+
+        status = getattr(response, "status_code", 0)
+        if status in (200, 201):
+            body = self._json_body(response, "create-issue")
+            if not isinstance(body, dict) or not (body.get("key") or body.get("id")):
+                raise ProviderAPIError(
+                    "Jira accepted the issue but returned no issue key, so it cannot be "
+                    "reported or linked. Check Jira before trying again."
+                )
+            return body
+
+        detail = self._error_detail(response)
+        if status == 401:
+            raise ProviderAuthenticationError(
+                "Jira rejected the access token while creating an issue. The issue was not "
+                "created. Reconnect and review the plan before trying again. "
+                "({})".format(detail)
+            )
+        if status == 403:
+            raise ProviderConsentRequiredError(
+                "Jira refused to create the issue. The authorization is missing the `{}` "
+                "scope, or the account lacks Create Issues permission on this project. "
+                "Reconnecting re-runs consent. ({})".format(self.WRITE_SCOPE, detail)
+            )
+        if status == 429:
+            raise ProviderAPIError(
+                "Jira rate-limited the creation request. This issue was not created; wait a "
+                "moment before trying again. ({})".format(detail),
+                status_code=429,
+            )
+        raise ProviderAPIError(
+            "Jira returned HTTP {} while creating the issue: {}".format(status, detail),
+            status_code=status,
         )

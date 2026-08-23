@@ -511,7 +511,17 @@ def test_disconnect_clears_the_discovered_sites_and_selection(configured):
 
 # --- Read-only boundary ---------------------------------------------------
 
-def test_site_discovery_adds_no_write_capability():
-    """Discovery is GET-only; issue creation belongs to a later ticket."""
-    for absent in ("create_issue", "create_issues", "update_issue", "delete_issue"):
+def test_site_discovery_writes_nothing(configured, monkeypatch):
+    """
+    Discovery is GET-only. JIRA-007 added ``create_issue`` to the service, so "no write
+    method exists" is no longer the way to state that -- what matters is that listing
+    sites sends no write request, which the autouse ``forbid_write_requests`` fixture
+    enforces for every verb that could change something in Jira.
+    """
+    recorder = patch_get(monkeypatch, FakeResponse(payload=[SITE_A]))
+
+    configured.list_accessible_sites(ACCESS_TOKEN)
+
+    assert len(recorder.calls) == 1
+    for absent in ("create_issues", "update_issue", "delete_issue"):
         assert not hasattr(JiraService, absent), absent
