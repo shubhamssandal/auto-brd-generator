@@ -351,6 +351,15 @@ class PlannedIssue:
     this restates, so a reviewer can check any proposed issue against what was
     actually said. The verbatim transcript quote itself travels inside
     ``description``, which is what would reach Jira, rather than being held twice.
+
+    Traceability comes in two shapes because two planners produce these.
+    ``source_requirement_id`` is the one-to-one mapping's single requirement.
+    ``source_requirement_ids`` and ``source_action_item_ids`` are the decomposing
+    planner's answer, where one work item can implement several requirements and an
+    action item can be the thing that justifies it. ``requirement_ids`` reads both, so
+    a caller never has to know which planner built the issue. ``rationale`` is one
+    short sentence of traceability -- which requirement this serves -- and never the
+    model's reasoning.
     """
 
     plan_key: str
@@ -363,6 +372,27 @@ class PlannedIssue:
     parent_plan_key: str = ""
     source_requirement_id: str = ""
     selected: bool = True
+    source_requirement_ids: tuple = ()
+    source_action_item_ids: tuple = ()
+    rationale: str = ""
+
+    @property
+    def requirement_ids(self) -> tuple:
+        """Every BRD requirement id this issue traces back to, however it was planned."""
+        if self.source_requirement_ids:
+            return tuple(self.source_requirement_ids)
+        return (self.source_requirement_id,) if self.source_requirement_id else ()
+
+    @property
+    def is_traceable(self) -> bool:
+        """
+        Whether this issue names something in the BRD it came from.
+
+        An issue that traces to nothing is a requirement this app invented, which is
+        the one thing it is built not to do -- so a planner drops such an issue rather
+        than proposing it.
+        """
+        return bool(self.requirement_ids or self.source_action_item_ids)
 
 
 @dataclass(frozen=True)

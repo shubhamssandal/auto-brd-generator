@@ -39,7 +39,8 @@ without a live model.
 """
 
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from typing import Optional
 
 from brd_models import BRDData, Requirement
 from jira_models import (
@@ -57,13 +58,13 @@ _ROOT_PLAN_KEY = "BRD"
 # Appended to every proposed description. Survives into Jira if a later ticket
 # creates the issue, which is where it earns its place: someone reading the issue in
 # Jira can tell where it came from.
-_PROVENANCE = (
+PROVENANCE = (
     "_Proposed by Auto-BRD Generator from the reviewed BRD. "
     "Not yet created in Jira._"
 )
 
 
-def _summary(text: str) -> str:
+def summary_line(text: str) -> str:
     """
     A Jira-acceptable summary line.
 
@@ -150,6 +151,100 @@ def choose_issue_types(metadata: JiraProjectMetadata) -> tuple:
     return container, item, (subtask_types[0] if subtask_types else None)
 
 
+@dataclass(frozen=True)
+class PlanLevel:
+    """
+    One rung of the selected project's own hierarchy that a plan may use.
+
+    ``depth`` is plan-local -- 0 is the top rung available here -- while
+    ``hierarchy_level`` is whatever number Jira reported for it. The two are kept
+    apart because a project's levels need not be contiguous or start anywhere in
+    particular, and a plan that reasoned about Jira's numbers directly would break on
+    the next project.
+
+    ``types`` holds every validated issue type at this rung, in the order Jira listed
+    them. More than one is normal: a project commonly offers Story, Task and Bug
+    together. ``default_type`` is the first, which is what a plan uses when nothing
+    picks between them.
+    """
+
+    depth: int
+    hierarchy_level: Optional[int]
+    types: tuple
+    subtask: bool = False
+
+    @property
+    def default_type(self):
+        return self.types[0]
+
+    @property
+    def type_names(self) -> tuple:
+        return tuple(issue_type.name or issue_type.id for issue_type in self.types)
+
+    def type_named(self, name: str):
+        """
+        The type at this rung whose Jira name matches ``name``, or ``None``.
+
+        Exact match on the name Jira reported, case-insensitively. Deliberately not
+        fuzzy: a near-miss would silently create an issue as a type the caller did not
+        ask for, and the caller can fall back to ``default_type`` itself.
+        """
+        wanted = str(name or "").strip().lower()
+        if not wanted:
+            return None
+        for issue_type in self.types:
+            if (issue_type.name or "").strip().lower() == wanted:
+                return issue_type
+        return None
+
+
+def plannable_levels(metadata: JiraProjectMetadata) -> tuple:
+    """
+    Every rung of this project's hierarchy a plan may use, deepest container first.
+
+    The generalisation of ``choose_issue_types`` from three fixed slots to however
+    many levels Jira actually reported, which is what lets a plan be as deep as the
+    project supports rather than as deep as this app assumed. Same eligibility rule:
+    only issue types that passed the required-field check appear, because a type Jira
+    would refuse for want of a field this app cannot supply has no business in a plan
+    a later step is meant to be able to create.
+
+    Ordering is Jira's ``hierarchyLevel``, descending, and never a name -- so a
+    project calling its top level "Initiative" and one calling it "Epic" are treated
+    identically. Subtask types form the bottom rung regardless of the level they
+    report, because Jira requires a subtask to have a parent.
+
+    A subtask rung is dropped when no standard rung exists above it: a subtask with
+    nothing to hang from cannot be created. A project whose validated types all
+    reported no level at all gets a single flat rung, matching
+    ``choose_issue_types``.
+    """
+    plannable = metadata.plannable_issue_types
+    subtask_types = tuple(issue_type for issue_type in plannable if issue_type.subtask)
+    standard = [issue_type for issue_type in plannable if not issue_type.subtask]
+
+    by_level: dict = {}
+    for issue_type in standard:
+        if issue_type.hierarchy_level is not None:
+            by_level.setdefault(issue_type.hierarchy_level, []).append(issue_type)
+
+    rungs: list = []
+    if by_level:
+        for level in sorted(by_level, reverse=True):
+            rungs.append((level, tuple(by_level[level]), False))
+    elif standard:
+        # No reported level anywhere, so nothing can be ordered against anything else.
+        rungs.append((None, (standard[0],), False))
+
+    if subtask_types and rungs:
+        rungs.append((subtask_types[0].hierarchy_level, subtask_types, True))
+
+    return tuple(
+        PlanLevel(depth=depth, hierarchy_level=level, types=types, subtask=subtask)
+        for depth, (level, types, subtask) in enumerate(rungs)
+    )
+
+
 def _container_description(brd_data: BRDData) -> str:
     lines: list = []
     overview = brd_data.project_overview
@@ -167,7 +262,7 @@ def _container_description(brd_data: BRDData) -> str:
     if background:
         lines.extend(background + [""])
 
-    lines.append(_PROVENANCE)
+    lines.append(PROVENANCE)
     return "\n".join(lines).strip()
 
 
@@ -184,7 +279,7 @@ def _requirement_description(requirement: Requirement) -> str:
                 "",
             ]
         )
-    lines.append(_PROVENANCE)
+    lines.append(PROVENANCE)
     return "\n".join(lines).strip()
 
 
@@ -194,11 +289,29 @@ def _action_item_description(action_item, parent_plan_key: str) -> str:
         lines.append("**Owner stated in the meeting:** {}".format(action_item.owner))
     if action_item.due_date:
         lines.append("**Due date stated in the meeting:** {}".format(action_item.due_date))
-    lines.extend(["**Names BRD requirement:** {}".format(parent_plan_key), "", _PROVENANCE])
+    lines.extend(["**Names BRD requirement:** {}".format(parent_plan_key), "", PROVENANCE])
     return "\n".join(lines).strip()
 
 
-def _plan_keys(requirements: list) -> list:
+def confirmed_requirements(brd_data: BRDData) -> list:
+    """
+    The BRD requirements a plan may propose issues for, functional then
+    non-functional.
+
+    One list rather than two: both kinds passed the same evidence check, and nothing
+    downstream treats them differently. A requirement with no statement is left out --
+    it would become an issue with an empty summary, which Jira refuses.
+    """
+    return [
+        requirement
+        for requirement in (
+            list(brd_data.functional_requirements) + list(brd_data.non_functional_requirements)
+        )
+        if str(requirement.statement or "").strip()
+    ]
+
+
+def plan_keys(requirements: list) -> list:
     """
     One unique plan-local key per requirement, preferring its BRD id.
 
@@ -283,13 +396,7 @@ def build_work_plan(
             )
         return empty()
 
-    requirements = [
-        requirement
-        for requirement in (
-            list(brd_data.functional_requirements) + list(brd_data.non_functional_requirements)
-        )
-        if str(requirement.statement or "").strip()
-    ]
+    requirements = confirmed_requirements(brd_data)
     if not requirements:
         notes.append(
             "No plan was generated: this BRD holds no confirmed requirement. Only "
@@ -298,7 +405,7 @@ def build_work_plan(
         )
         return empty()
 
-    keys = _plan_keys(requirements)
+    keys = plan_keys(requirements)
 
     # Acceptance criteria are stated for the BRD as a whole. One is attached to a
     # requirement only when it names that requirement.
@@ -326,7 +433,7 @@ def build_work_plan(
         issues.append(
             PlannedIssue(
                 plan_key=root_key,
-                summary=_summary(brd_data.project_title or "Untitled Project"),
+                summary=summary_line(brd_data.project_title or "Untitled Project"),
                 issue_type_id=container_type.id,
                 issue_type_name=container_type.name,
                 hierarchy_level=container_type.hierarchy_level,
@@ -351,7 +458,7 @@ def build_work_plan(
         issues.append(
             PlannedIssue(
                 plan_key=key,
-                summary=_summary(requirement.statement),
+                summary=summary_line(requirement.statement),
                 issue_type_id=item_type.id,
                 issue_type_name=item_type.name,
                 hierarchy_level=item_type.hierarchy_level,
@@ -387,7 +494,7 @@ def build_work_plan(
         issues.append(
             PlannedIssue(
                 plan_key="{}-A{}".format(target, index),
-                summary=_summary(action_item.item),
+                summary=summary_line(action_item.item),
                 issue_type_id=subtask_type.id,
                 issue_type_name=subtask_type.name,
                 hierarchy_level=subtask_type.hierarchy_level,

@@ -22,8 +22,8 @@ from transcript_processor import (
     TranscriptProcessingError,
 )
 from jira_models import CreatedIssue
+from jira_planner import action_item_index, generate_work_plan
 from jira_processor import (
-    build_work_plan,
     compatible_issue_types,
     creation_order,
     delete_planned_issue,
@@ -64,6 +64,39 @@ CLIENT = None
 
 if GEMINI_API_KEY:
     CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+
+# The one model this app calls, named once so BRD generation and Jira work planning
+# cannot drift onto different models.
+GEMINI_MODEL = "gemini-3.6-flash"
+
+
+def _gemini_json(prompt: str) -> str:
+    """
+    Send one prompt to the configured model and return its response text.
+
+    Exists so the Jira planner can be handed a model call as a plain ``str -> str``
+    function. ``jira_planner`` therefore holds no client, no API key and no import of
+    this module: it cannot reach the network by itself, and it can be tested without a
+    live model. Requires ``CLIENT``; callers check that through ``_planner_generate``.
+    """
+    response = CLIENT.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    return response.text or ""
+
+
+def _planner_generate():
+    """
+    The model call the Jira planner should use, or ``None`` when none is configured.
+
+    ``None`` is not a failure: ``generate_work_plan`` falls back to the deterministic
+    one-to-one mapping and records why in the plan's notes, so the Jira step still
+    works without a key.
+    """
+    return _gemini_json if CLIENT is not None else None
+
 
 def _validate_requirements(
     requirements_data: list[dict], original_notes: str
@@ -216,7 +249,7 @@ def generate_brd_from_notes(notes: str) -> BRDData:
     """
 
     response = CLIENT.models.generate_content(
-        model="gemini-3.6-flash",
+        model=GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
@@ -1344,6 +1377,13 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     """
     Step 4: propose Jira issues from the reviewed BRD. Creates nothing.
 
+    The plan comes from ``jira_planner.generate_work_plan``, which asks the configured
+    model how the approved requirements should be grouped into this project's own
+    hierarchy and then validates that answer deterministically. With no model
+    configured -- or a model that returns nothing usable -- it falls back to the
+    one-to-one mapping and says so in the plan's notes, so this panel behaves the same
+    either way.
+
     Deliberately takes no service and no token. With neither in scope this panel has
     no way to reach Jira, so "generating a plan creates nothing" is a property of the
     code rather than a promise in a caption. ``scope`` is the (site, project) pair the
@@ -1379,8 +1419,10 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
         # its in-flight guard must not carry over onto it.
         for suffix in ("created", "creating", "confirm_create"):
             st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
-        with st.spinner("Mapping BRD requirements onto this project's issue types..."):
-            st.session_state[plan_key] = build_work_plan(brd_data, project, metadata)
+        with st.spinner("Grouping BRD requirements into this project's hierarchy..."):
+            st.session_state[plan_key] = generate_work_plan(
+                brd_data, project, metadata, generate=_planner_generate()
+            )
         st.session_state[plan_for_key] = scope
 
     plan = st.session_state.get(plan_key)
@@ -1432,7 +1474,7 @@ def _render_work_plan(plan, metadata, project=None) -> None:
         st.error(message)
 
     st.caption(
-        "A proposal only — nothing above exists in Jira. Edits, selection and deletion "
+        "Proposal only — nothing has been created in Jira. Edits, selection and deletion "
         "stay in this session and do not create issues."
     )
 
@@ -1443,6 +1485,63 @@ def _criteria_text(criteria) -> str:
 
 def _criteria_from_text(text: str) -> tuple:
     return tuple(line.strip() for line in str(text or "").splitlines() if line.strip())
+
+
+def _linked_action_items(issue) -> list:
+    """
+    One issue's linked action items as ``(id, text)`` pairs.
+
+    The plan stores ids, because an id is what survives a round trip through session
+    state and into a Jira description; the text is what a reviewer actually needs to
+    read. It is resolved against the BRD still in session, and the id is shown alone
+    if that BRD has been replaced.
+    """
+    identifiers = list(issue.source_action_item_ids)
+    if not identifiers:
+        return []
+    brd_data = st.session_state.get(BRD_SESSION_KEY)
+    index = action_item_index(brd_data) if isinstance(brd_data, BRDData) else {}
+    return [
+        (identifier, str(getattr(index.get(identifier), "item", "") or ""))
+        for identifier in identifiers
+    ]
+
+
+def _render_issue_traceability(issue) -> None:
+    """
+    Where one proposed issue came from in the BRD. Read-only.
+
+    Read-only deliberately: an issue's sources are the record of what justifies
+    proposing it, so they are shown rather than offered as editable fields --
+    ``jira_processor._EDITABLE_ISSUE_FIELDS`` excludes them for the same reason. A
+    reviewer who disagrees with the traceability deletes the issue rather than
+    rewriting its provenance.
+
+    An issue with no requirement id is not an error: the deterministic mapping's
+    grouping issue restates the project title rather than a requirement, so the absence
+    is stated plainly instead of flagged.
+    """
+    if issue.parent_plan_key:
+        st.caption("Proposed beneath {} in this plan.".format(issue.parent_plan_key))
+
+    if issue.requirement_ids:
+        st.markdown(
+            "**Source BRD requirement(s):** "
+            + ", ".join("`{}`".format(identifier) for identifier in issue.requirement_ids)
+        )
+    else:
+        st.caption("No BRD requirement id is recorded on this issue.")
+
+    linked = _linked_action_items(issue)
+    if linked:
+        st.markdown("**Linked action item(s) from the meeting**")
+        for identifier, text in linked:
+            st.markdown(
+                "- `{}` {}".format(identifier, text) if text else "- `{}`".format(identifier)
+            )
+
+    if issue.rationale:
+        st.markdown("**Why this issue:** {}".format(issue.rationale))
 
 
 def _render_planned_issue(plan, issue, depth: int, metadata):
@@ -1480,6 +1579,7 @@ def _render_planned_issue(plan, issue, depth: int, metadata):
     with st.expander("Details — {}".format(issue.plan_key)):
         if issue.hierarchy_level is not None:
             st.caption("Jira hierarchy level {} in this project.".format(issue.hierarchy_level))
+        _render_issue_traceability(issue)
 
         summary = st.text_input(
             "Summary",
