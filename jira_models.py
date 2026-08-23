@@ -408,12 +408,21 @@ class CreatedIssue:
     ``error`` carries the reason on failure. Exactly one of the two is populated, so
     ``succeeded`` is a fact about the record rather than a separate flag that could
     disagree with it.
+
+    ``summary`` and the two source-id tuples are copied off the ``PlannedIssue`` at
+    the moment it was attempted, rather than looked up in the plan afterwards. The
+    reviewer can replace the plan in the same session, and a result that pointed into
+    a plan that no longer holds that item would lose the very traceability this record
+    exists to show.
     """
 
     plan_key: str
     issue_key: str = ""
     issue_id: str = ""
     error: str = ""
+    summary: str = ""
+    source_requirement_ids: tuple = ()
+    source_action_item_ids: tuple = ()
 
     @property
     def succeeded(self) -> bool:

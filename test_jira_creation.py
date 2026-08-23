@@ -30,7 +30,12 @@ import jira_processor
 import jira_service
 import main
 from jira_models import CreatedIssue, JiraSite
-from jira_processor import build_work_plan, creation_order, issue_creation_payload
+from jira_processor import (
+    build_work_plan,
+    creation_order,
+    issue_browse_url,
+    issue_creation_payload,
+)
 from jira_service import JiraService
 from providers.base import (
     ProviderAPIError,
@@ -385,7 +390,7 @@ def test_a_partial_failure_stops_and_still_reports_what_was_created(configured, 
 
 
 def test_the_results_keep_created_and_failed_apart(monkeypatch):
-    shown = {key: [] for key in ("success", "error", "write", "caption")}
+    shown = {key: [] for key in ("success", "error", "write", "caption", "markdown")}
     for widget in shown:
         monkeypatch.setattr(
             main.st, widget, lambda text, *a, _w=widget, **k: shown[_w].append(str(text))
@@ -400,9 +405,104 @@ def test_the_results_keep_created_and_failed_apart(monkeypatch):
 
     assert any("Created 1 issue" in text for text in shown["success"])
     assert any("1 issue(s) were not created" in text for text in shown["error"])
+    assert "ENG-100" in " ".join(shown["markdown"])
     rendered = " ".join(shown["write"])
-    assert "ENG-100" in rendered and CHILD in rendered and "bad field" in rendered
+    assert CHILD in rendered and "bad field" in rendered
     assert any("retried automatically" in text for text in shown["caption"])
+
+
+# --- JIRA-008: which planned item became which Jira issue ------------------
+
+@pytest.mark.parametrize(
+    "site_url, issue_key, expected",
+    [
+        ("https://acme-eng.atlassian.net", "ENG-100",
+         "https://acme-eng.atlassian.net/browse/ENG-100"),
+        ("https://acme-eng.atlassian.net/", "ENG-100",
+         "https://acme-eng.atlassian.net/browse/ENG-100"),
+        ("", "ENG-100", ""),
+        ("https://acme-eng.atlassian.net", "", ""),
+    ],
+)
+def test_the_issue_link_is_built_from_the_selected_site(site_url, issue_key, expected):
+    assert issue_browse_url(site_url, issue_key) == expected
+
+
+def test_each_result_carries_the_plan_item_and_its_brd_sources(configured, monkeypatch):
+    """
+    The mapping is recorded as the run happens, not looked up in the plan afterwards:
+    the reviewer can replace the plan in the same session.
+    """
+    patch_post(monkeypatch, created_ok("ENG-100", "1"), created_ok("ENG-101", "2"),
+               created_ok("ENG-102", "3"), created_ok("ENG-103", "4"))
+    plan = a_plan()
+    planned = issues_by_key(plan)
+
+    results = main._create_selected_issues(configured, tokens(), SITE.id, PROJECT, plan)
+
+    by_plan_key = {record.plan_key: record for record in results}
+    assert by_plan_key[CHILD].summary == planned[CHILD].summary
+    assert by_plan_key[CHILD].source_requirement_ids == planned[CHILD].requirement_ids
+    assert CHILD in by_plan_key[CHILD].source_requirement_ids
+    assert by_plan_key[GRANDCHILD].source_action_item_ids == tuple(
+        planned[GRANDCHILD].source_action_item_ids
+    )
+
+
+def test_a_partial_failure_maps_both_outcomes_back_to_their_plan_items(
+    configured, monkeypatch
+):
+    patch_post(
+        monkeypatch,
+        created_ok("ENG-100", "1"),
+        created_ok("ENG-101", "2"),
+        FakeResponse(400, {"message": "field 'summary' is required"}),
+    )
+    plan = a_plan()
+
+    results = main._create_selected_issues(configured, tokens(), SITE.id, PROJECT, plan)
+    shown = {key: [] for key in ("success", "error", "write", "caption", "markdown")}
+    for widget in shown:
+        monkeypatch.setattr(
+            main.st, widget, lambda text, *a, _w=widget, **k: shown[_w].append(str(text))
+        )
+    main._render_created_results(results, SITE.url)
+
+    created, failed = results[1], results[-1]
+    assert created.succeeded and not failed.succeeded
+    assert failed.summary and failed.source_requirement_ids
+
+    link = " ".join(shown["markdown"])
+    assert "[ENG-101]({}/browse/ENG-101)".format(SITE.url) in link
+    assert created.summary in link
+    assert "from requirement(s) {}".format(", ".join(created.source_requirement_ids)) in link
+
+    not_created = " ".join(shown["write"])
+    assert failed.plan_key in not_created and "summary" in not_created
+    assert failed.summary in not_created
+    assert "ENG-101" not in not_created, "a failure line must not read as a success"
+
+
+def test_the_mapping_survives_the_reruns_that_follow_a_run(configured, monkeypatch):
+    """Stored results are re-rendered with their links, so the trail stays available."""
+    st.session_state[main._skey("jira", "created")] = (
+        CreatedIssue(
+            plan_key=ROOT,
+            issue_key="ENG-100",
+            issue_id="1",
+            summary="Ordering programme",
+            source_requirement_ids=("FR-1",),
+            source_action_item_ids=("AI-1",),
+        ),
+    )
+    forbid_post(monkeypatch, "a completed run must not create anything again")
+
+    shown = render_creation_panel(monkeypatch, configured, clicked=(), plan=a_plan())
+
+    line = " ".join(shown["markdown"])
+    assert "[ENG-100]({}/browse/ENG-100)".format(SITE.url) in line
+    assert "Ordering programme" in line
+    assert "requirement(s) FR-1" in line and "action item(s) AI-1" in line
 
 
 # --- Nothing is created without an explicit, confirmed action -------------

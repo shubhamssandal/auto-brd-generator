@@ -819,6 +819,23 @@ def _adf(text: str) -> dict:
     }
 
 
+def issue_browse_url(site_url: str, issue_key: str) -> str:
+    """
+    The page a created issue can be opened at on its own Jira site.
+
+    ``/browse/{key}`` is the site-relative path Jira itself uses for an issue, so this
+    is built from the site URL the account already selected rather than from anything
+    the API returned: the create response's ``self`` link addresses the REST resource,
+    not a page a person can read.
+
+    Returns "" when either part is missing -- a link that could not be built is left
+    out rather than rendered as a URL that would 404.
+    """
+    site = str(site_url or "").strip().rstrip("/")
+    key = str(issue_key or "").strip()
+    return "{}/browse/{}".format(site, key) if site and key else ""
+
+
 def issue_creation_payload(
     issue: PlannedIssue,
     project_id_or_key: str,

@@ -27,6 +27,7 @@ from jira_processor import (
     compatible_issue_types,
     creation_order,
     delete_planned_issue,
+    issue_browse_url,
     issue_creation_payload,
     set_planned_issue_type,
     update_planned_issue,
@@ -1646,13 +1647,28 @@ def _render_planned_issue(plan, issue, depth: int, metadata):
     return plan
 
 
-def _render_created_results(created) -> None:
+def _traced_to(record) -> str:
+    """The BRD ids one result came from, as a caption suffix, or "" if it names none."""
+    parts = []
+    if record.source_requirement_ids:
+        parts.append("requirement(s) {}".format(", ".join(record.source_requirement_ids)))
+    if record.source_action_item_ids:
+        parts.append("action item(s) {}".format(", ".join(record.source_action_item_ids)))
+    return " — from {}".format(" and ".join(parts)) if parts else ""
+
+
+def _render_created_results(created, site_url: str = "") -> None:
     """
     What a creation run actually did, successes and failures kept apart.
 
     Rendered from stored results rather than from the run itself, so the outcome
     survives the reruns that follow it and a partial failure stays visible instead of
     vanishing on the next click.
+
+    Each line maps one proposed item to what became of it: the plan key, the summary
+    that was sent, the Jira key as a link to the issue, and the BRD requirements and
+    action items it came from. That is the whole trail from the meeting to the issue,
+    on one line, without a second place to look it up.
     """
     succeeded = [record for record in created if record.succeeded]
     failed = [record for record in created if not record.succeeded]
@@ -1660,18 +1676,42 @@ def _render_created_results(created) -> None:
     if succeeded:
         st.success("Created {} issue(s) in Jira.".format(len(succeeded)))
         for record in succeeded:
-            st.write("- `{}` — created as **{}**".format(record.plan_key, record.issue_key))
+            url = issue_browse_url(site_url, record.issue_key)
+            shown_key = (
+                "[{}]({})".format(record.issue_key, url) if url
+                else "**{}**".format(record.issue_key or record.issue_id)
+            )
+            st.markdown(
+                "- `{}` {} — created as {}{}".format(
+                    record.plan_key, record.summary, shown_key, _traced_to(record)
+                )
+            )
     if failed:
         st.error(
             "{} issue(s) were not created. The successes above were still created and "
             "are listed by their Jira key.".format(len(failed))
         )
         for record in failed:
-            st.write("- `{}` — not created: {}".format(record.plan_key, record.error))
+            st.write(
+                "- `{}` {} — not created: {}{}".format(
+                    record.plan_key, record.summary, record.error, _traced_to(record)
+                )
+            )
         st.caption(
             "Nothing is retried automatically: a create cannot be repeated safely without "
             "risking a duplicate. Deselect what already exists in Jira before trying again."
         )
+
+
+def _result_for(issue, **outcome) -> CreatedIssue:
+    """One creation outcome, carrying the plan item's own traceability with it."""
+    return CreatedIssue(
+        plan_key=issue.plan_key,
+        summary=issue.summary,
+        source_requirement_ids=issue.requirement_ids,
+        source_action_item_ids=tuple(issue.source_action_item_ids),
+        **outcome,
+    )
 
 
 def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
@@ -1707,11 +1747,11 @@ def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
                 payload=payload,
             )
         except Exception as e:
-            created.append(CreatedIssue(plan_key=issue.plan_key, error=str(e)))
+            created.append(_result_for(issue, error=str(e)))
             break
 
-        record = CreatedIssue(
-            plan_key=issue.plan_key,
+        record = _result_for(
+            issue,
             issue_key=str(body.get("key") or ""),
             issue_id=str(body.get("id") or ""),
         )
@@ -1738,7 +1778,7 @@ def _render_jira_creation_panel(service, tokens, site, project, metadata) -> Non
     created = st.session_state.get(created_key)
     if created:
         st.markdown("**Step 5 — create the selected issues**")
-        _render_created_results(created)
+        _render_created_results(created, site.url)
         return
 
     if plan is None or plan.is_empty:
@@ -1847,7 +1887,7 @@ def _render_jira_creation_panel(service, tokens, site, project, metadata) -> Non
 
     if results:
         st.session_state[created_key] = results
-    _render_created_results(results or ())
+    _render_created_results(results or (), site.url)
 
 
 def _render_jira_section() -> None:
