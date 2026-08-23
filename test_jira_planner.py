@@ -462,6 +462,47 @@ def test_an_item_at_a_subtask_level_with_no_parent_is_raised_to_stand_alone():
     assert validate_work_plan(plan, FULL, PROJECT) == ()
 
 
+def test_an_item_whose_parent_skips_a_level_is_moved_directly_below_it():
+    """A level cannot be skipped: Jira has no place for a child two rungs down."""
+    payload = {
+        "items": [
+            {"id": "P1", "summary": "Direct-to-consumer ordering programme",
+             "issue_type": "Programme", "level": 0, "requirement_ids": ["FR-1"]},
+            {"id": "W1", "summary": "Online order placement screen",
+             "issue_type": "Work package", "level": 2, "parent": "P1",
+             "requirement_ids": ["FR-1"]},
+        ]
+    }
+
+    plan = plan_from(payload)
+
+    moved = issues_by_key(plan)["W1"]
+    assert moved.parent_plan_key == "P1"
+    assert moved.issue_type_name == "Stream"  # one level below Programme, not two
+    assert "skips a level this project reports" in note_matching(plan, "skips a level")
+    assert validate_work_plan(plan, FULL, PROJECT) == ()
+
+
+def test_a_subtask_hung_off_a_higher_ancestor_is_moved_directly_below_it():
+    """A subtask needs a parent at the level directly above it, not an ancestor."""
+    payload = {
+        "items": [
+            {"id": "P1", "summary": "Direct-to-consumer ordering programme",
+             "issue_type": "Programme", "level": 0, "requirement_ids": ["FR-1"]},
+            {"id": "T1", "summary": "Chase the stock feed schedule", "issue_type": "Step",
+             "level": 3, "parent": "P1", "requirement_ids": ["FR-1"]},
+        ]
+    }
+
+    plan = plan_from(payload)
+
+    moved = issues_by_key(plan)["T1"]
+    assert moved.parent_plan_key == "P1"
+    assert moved.issue_type_name == "Stream"  # no longer the subtask type "Step"
+    assert validate_work_plan(plan, FULL, PROJECT) == ()
+    assert [issue.plan_key for issue in creation_order(plan)] == ["P1", "T1"]
+
+
 # --- A malformed answer is repaired, and the repair is reported -------------
 
 def test_a_parent_that_names_nothing_in_the_plan_is_dropped_and_reported():

@@ -884,6 +884,7 @@ def assemble_plan(
 
     flattened = 0
     detached = 0
+    skipped = 0
     for _ in range(_MAX_REPAIR_PASSES):
         changed = False
         for draft in drafts.values():
@@ -896,6 +897,17 @@ def assemble_plan(
                 draft.parent = parent.parent
                 parent = drafts.get(draft.parent)
                 flattened += 1
+                changed = True
+            if parent is not None and parent.depth < draft.depth - 1:
+                # A parent more than one level above its child skips a level, which the
+                # levels this project reported do not allow: a subtask in particular
+                # needs a parent at the level directly above it, so one hung off a
+                # higher ancestor could not be created at all. Raise the child to sit
+                # directly beneath the parent the planner chose, rather than dropping
+                # the relationship -- the same choice the re-pointing above makes. Its
+                # own children are re-checked on the next pass.
+                draft.depth = parent.depth + 1
+                skipped += 1
                 changed = True
             if not draft.parent and levels_by_depth[draft.depth].subtask:
                 # A subtask with no parent cannot be created. Raise it to the deepest
@@ -929,6 +941,12 @@ def assemble_plan(
             "{} proposed item(s) were placed at a subtask level with no parent. A "
             "subtask cannot be created without one, so each was raised to the deepest "
             "level that can stand alone.".format(detached)
+        )
+    if skipped:
+        notes.append(
+            "{} proposed item(s) named a parent more than one level above them, which "
+            "skips a level this project reports. Each was moved to the level directly "
+            "below its parent.".format(skipped)
         )
 
     # --- Pass 4: traceability, containers inheriting from what they contain --------
