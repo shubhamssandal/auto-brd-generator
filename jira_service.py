@@ -127,6 +127,13 @@ class JiraService:
     ISSUE_TYPES_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes"
     ISSUE_TYPE_FIELDS_PATH = "/rest/api/3/issue/createmeta/{project}/issuetypes/{issue_type}"
 
+    # JIRA-010's whole read addition: one issue's current summary and description, so a
+    # direct edit in Jira can be compared with what this app last synchronized. Only
+    # these two fields are requested -- they are the two this app ever wrote, and
+    # asking for more would read issue data the reconciliation has no use for.
+    ISSUE_PATH = "/rest/api/3/issue/{issue}"
+    ISSUE_READ_FIELDS = "summary,description"
+
     # The only write path in this app. Same verification caveat as the read paths
     # above: it is the documented Jira Cloud platform v3 create-issue route as
     # understood here, but the reference page could not be fetched in this
@@ -765,6 +772,47 @@ class JiraService:
             notes=tuple(notes),
             truncated=truncated,
         )
+
+    # --- JIRA-010: reading back one issue this app created --------------------
+
+    def get_issue_fields(
+        self, access_token: str, cloud_id: str, issue_key: str
+    ) -> dict[str, Any]:
+        """
+        The current ``summary`` and ``description`` of one issue, as Jira returned them.
+
+        A read, and the smallest one that answers JIRA-010's question: has this issue
+        been edited away from what the BRD says? Only the two fields this app ever
+        wrote are requested. The ``description`` is handed back as Jira sent it --
+        flattening ADF to comparable text is the processing layer's job, so this method
+        stays what every other method here is: an HTTP call and a shape check.
+
+        Covered by the ``read:jira-work`` scope the project list already needs, so no
+        new consent is involved. Raises the same errors as every other read: an expired
+        token surfaces as ``ProviderTokenExpiredError`` for ``call_with_refresh``.
+        """
+        key = str(issue_key or "").strip()
+        if not key:
+            raise ProviderAPIError("No Jira issue key was given, so nothing could be read.")
+
+        url = self.site_api_url(
+            cloud_id, self.ISSUE_PATH.format(issue=urllib.parse.quote(key, safe=""))
+        )
+        response = self._api_get(
+            url, access_token, params={"fields": self.ISSUE_READ_FIELDS}
+        )
+        body = self._json_body(response, "get-issue")
+        fields = body.get("fields") if isinstance(body, dict) else None
+        if not isinstance(fields, dict):
+            raise ProviderAPIError(
+                "Jira returned no fields for issue {}, so its current state is "
+                "unknown.".format(key)
+            )
+        return {
+            "issue_key": str(body.get("key") or key),
+            "summary": str(fields.get("summary") or "").strip(),
+            "description": fields.get("description"),
+        }
 
     # --- The one write ------------------------------------------------------
 
