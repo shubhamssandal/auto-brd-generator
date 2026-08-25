@@ -2199,11 +2199,10 @@ def _render_change_decisions(proposal: ChangeProposal, changes_key: str, brd_dat
             continue
 
         if change.is_from_jira:
-            approve, accept, reject, keep = st.columns(4)
-            if approve.button(
-                "Approve", key="approve_change_{}".format(change.change_id), disabled=not change.is_decidable
-            ):
-                _record_change_decision(changes_key, proposal, change.change_id, "approved")
+            # "Accept Jira → BRD" is the approval for a Jira edit. A second, generically
+            # labelled Approve button would record the identical decision, which on a
+            # governance screen reads as a different one.
+            accept, reject, keep = st.columns(3)
             if accept.button(
                 "Accept Jira → BRD",
                 key="accept_jira_change_{}".format(change.change_id),
@@ -2231,7 +2230,12 @@ def _render_change_decisions(proposal: ChangeProposal, changes_key: str, brd_dat
                 "The BRD and Jira were left unchanged."
             )
             return
-        _store_brd(updated)
+        # Deliberately not _store_brd: this amends the reviewed BRD rather than replacing
+        # it, so the creation results and the synchronization baseline stay valid. They
+        # record what already exists in Jira, which an approved BRD edit does not undo.
+        # The decided proposal stays too, so the approved and rejected outcome survives
+        # the rerun; apply_approved_changes re-checks each stored value before touching it.
+        st.session_state[BRD_SESSION_KEY] = updated
         _flash("success", "Applied {} approved requirement change(s) to the BRD.".format(len(applied)))
         st.rerun()
 

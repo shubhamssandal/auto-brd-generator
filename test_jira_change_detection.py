@@ -1,7 +1,9 @@
 """JIRA-010 tests for deterministic requirement-change reconciliation."""
 
 import pytest
+import streamlit as st
 
+import main
 from brd_models import BRDData, NormalizedTranscript, Requirement
 from jira_change_detector import (
     apply_approved_changes,
@@ -433,3 +435,67 @@ def test_jira_field_reader_surfaces_api_failure_without_a_proposal(monkeypatch):
 
     with pytest.raises(ProviderAPIError, match="HTTP 500"):
         JiraService().get_issue_fields("access-token", "cloud-id", "ENG-10")
+
+
+def test_applying_an_approved_change_keeps_the_traceability_it_was_reviewed_against(monkeypatch):
+    """
+    Approval amends the reviewed BRD; it does not replace it. The creation results and
+    the synchronization baseline describe issues that already exist in Jira, so an
+    approved BRD edit must leave both in place -- otherwise the requirement keeps its
+    link to no work at all and Jira drift can never be checked again. The decided
+    proposal survives too, so the approved and rejected outcome is still on screen.
+    """
+    change = RequirementChange(
+        change_id="J-ENG-10",
+        source_type="jira",
+        change_type="CHANGED",
+        requirement_id="FR-1",
+        old_text="The system shall accept card payments.",
+        proposed_new_text="The system shall accept card and wallet payments.",
+        jira_issue_key="ENG-10",
+    )
+    rejected = RequirementChange(
+        change_id="J-ENG-11",
+        source_type="jira",
+        change_type="CHANGED",
+        requirement_id="FR-2",
+        old_text="The system shall email a receipt.",
+        proposed_new_text="The system shall text a receipt.",
+        jira_issue_key="ENG-11",
+    )
+    proposal = decide_change(
+        decide_change(
+            ChangeProposal(source_type="jira", changes=(change, rejected)),
+            change.change_id,
+            "approved",
+        ),
+        rejected.change_id,
+        "rejected",
+    )
+
+    changes_key = main._skey("jira", "changes")
+    created_key = main._skey("jira", "created")
+    baseline_key = main._skey("jira", "change_baseline")
+    st.session_state[main.BRD_SESSION_KEY] = a_brd()
+    st.session_state[created_key] = a_created()
+    st.session_state[baseline_key] = a_baseline()
+    st.session_state[changes_key] = proposal
+
+    monkeypatch.setattr(
+        main.st, "button", lambda label, **k: k.get("key") == "apply_requirement_changes"
+    )
+    monkeypatch.setattr(main.st, "rerun", lambda *a, **k: None)
+
+    main._render_change_decisions(proposal, changes_key, a_brd())
+
+    stored = st.session_state[main.BRD_SESSION_KEY]
+    statements = [item.statement for item in stored.functional_requirements]
+    assert statements == [
+        "The system shall accept card and wallet payments.",
+        "The system shall email a receipt.",
+    ]
+    assert st.session_state[created_key] == a_created()
+    assert st.session_state[baseline_key] == a_baseline()
+    assert requirements_for_issue("ENG-10", st.session_state[created_key]) == ("FR-1",)
+    surviving = st.session_state[changes_key]
+    assert [item.approval_state for item in surviving.changes] == ["approved", "rejected"]
