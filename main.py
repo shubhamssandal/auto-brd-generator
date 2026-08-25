@@ -21,7 +21,14 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
-from jira_models import CreatedIssue
+from jira_models import ChangeProposal, CreatedIssue
+from jira_change_detector import (
+    apply_approved_changes,
+    decide_change,
+    detect_jira_changes,
+    detect_meeting_changes,
+    synchronized_baseline,
+)
 from jira_planner import action_item_index, generate_work_plan
 from jira_processor import (
     compatible_issue_types,
@@ -610,6 +617,23 @@ _JIRA_PROJECT_SUFFIXES = (
     "created",
     "creating",
     "confirm_create",
+    # JIRA-010. "changes" holds a detected requirement-change proposal. Its impact
+    # analysis names the plan keys and issue keys of this project, so it goes stale
+    # for exactly the same reasons the plan does and is dropped alongside it.
+    "changes",
+    # Immutable values sent at issue-creation time. Jira drift is compared against
+    # this snapshot, never against a plan the reviewer may later edit.
+    "change_baseline",
+)
+
+# The four evidence sources this app ingests. Named once because two pickers offer
+# them: the BRD generator above and requirement-change detection below, which compares
+# a later meeting against an approved BRD. Both routes reach the same normalizers.
+TRANSCRIPT_SOURCES = (
+    "Manual Paste",
+    "Upload Transcript File (.txt)",
+    "Google Meet",
+    "Microsoft Teams",
 )
 
 # The reviewed BRD, kept so it survives the script re-run that every button click
@@ -668,10 +692,19 @@ def _store_brd(brd_data: BRDData) -> None:
 
     A plan built from the previous BRD is dropped rather than left behind. A work
     plan is a proposal about one specific BRD, so a newly generated BRD makes a
-    cached plan wrong, not merely old.
+    cached plan wrong, not merely old. A detected requirement-change proposal goes
+    with it: it compares against the requirements that were approved when it ran.
     """
     st.session_state[BRD_SESSION_KEY] = brd_data
-    for suffix in ("plan", "plan_for", "created", "creating", "confirm_create"):
+    for suffix in (
+        "plan",
+        "plan_for",
+        "created",
+        "creating",
+        "confirm_create",
+        "changes",
+        "change_baseline",
+    ):
         st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
     _clear_jira_plan_review_widgets()
 
@@ -1410,15 +1443,30 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     # A plan describes one BRD against one project's issue types. If the target moved,
     # the cached plan is about something else.
     if st.session_state.get(plan_for_key) not in (None, scope):
-        for suffix in ("plan", "plan_for", "created", "creating", "confirm_create"):
+        for suffix in (
+            "plan",
+            "plan_for",
+            "created",
+            "creating",
+            "confirm_create",
+            "changes",
+            "change_baseline",
+        ):
             st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         _clear_jira_plan_review_widgets()
 
     if st.button("Generate Jira Work Plan", key="generate_jira_work_plan"):
         _clear_jira_plan_review_widgets()
         # A regenerated plan is a different proposal, so a previous run's results and
-        # its in-flight guard must not carry over onto it.
-        for suffix in ("created", "creating", "confirm_create"):
+        # its in-flight guard must not carry over onto it. A change proposal goes too:
+        # its impact analysis names plan keys this new plan may not contain.
+        for suffix in (
+            "created",
+            "creating",
+            "confirm_create",
+            "changes",
+            "change_baseline",
+        ):
             st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         with st.spinner("Grouping BRD requirements into this project's hierarchy..."):
             st.session_state[plan_key] = generate_work_plan(
@@ -1887,6 +1935,9 @@ def _render_jira_creation_panel(service, tokens, site, project, metadata) -> Non
 
     if results:
         st.session_state[created_key] = results
+        st.session_state[_skey(JIRA_STATE_NAME, "change_baseline")] = synchronized_baseline(
+            plan, results
+        )
     _render_created_results(results or (), site.url)
 
 
@@ -1974,6 +2025,356 @@ def _render_jira_section() -> None:
     )
 
 
+# --- Requirement change detection ---
+
+# How each detected change kind is headed on its review card. The stored values are
+# the deterministic ones from ``jira_models.CHANGE_TYPES``; these are only labels.
+_CHANGE_HEADINGS = {
+    "NEW": "New requirement",
+    "CHANGED": "Changed requirement",
+    "REMOVED_DEFERRED": "Removed or deferred",
+    "UNCHANGED": "Unchanged",
+    "UNCLEAR": "Unclear — needs manual review",
+}
+
+
+def _new_change_evidence(label: str) -> Optional[NormalizedTranscript]:
+    """
+    The later meeting to compare against the approved BRD, or ``None`` until asked.
+
+    Every route here is one this app already has. Pasted and uploaded text go through
+    the same two normalizers BRD generation uses, and Google Meet and Microsoft Teams
+    reuse the transcript already retrieved in the source section above rather than
+    fetching it a second time. There is no second ingestion path and no second
+    transcript shape: all four arrive as one ``NormalizedTranscript``.
+    """
+    if label == "Manual Paste":
+        notes = st.text_area(
+            "Paste the notes from the later meeting",
+            height=200,
+            placeholder="Paste what was decided after the BRD was approved...",
+            key="change_notes",
+        )
+        if st.button("Detect requirement changes", key="detect_manual", type="primary"):
+            try:
+                return normalize_manual_notes(notes)
+            except TranscriptProcessingError as error:
+                st.error(str(error))
+        return None
+
+    if label == "Upload Transcript File (.txt)":
+        uploaded = st.file_uploader(
+            "Upload the later transcript",
+            type=["txt"],
+            key="change_upload",
+        )
+        if st.button("Detect requirement changes", key="detect_upload", type="primary"):
+            if uploaded is None:
+                st.error("Upload a .txt transcript file before detecting changes.")
+            else:
+                try:
+                    return normalize_uploaded_file(uploaded)
+                except TranscriptProcessingError as error:
+                    st.error(str(error))
+        return None
+
+    provider_name = "google_meet" if label == "Google Meet" else "microsoft_teams"
+    transcript = st.session_state.get(_skey(provider_name, "transcript"))
+    if not isinstance(transcript, NormalizedTranscript):
+        st.caption(
+            "No {} transcript is loaded in this session. Load one in the transcript "
+            "source section above and it can be compared here without being retrieved "
+            "again.".format(label)
+        )
+        return None
+
+    st.caption(
+        "Comparing the {} transcript already loaded above{}. It is not retrieved "
+        "again.".format(
+            label,
+            ": {}".format(transcript.meeting_title) if transcript.meeting_title else "",
+        )
+    )
+    if st.button(
+        "Detect requirement changes", key="detect_{}".format(provider_name), type="primary"
+    ):
+        return transcript
+    return None
+
+
+def _render_requirement_change(change) -> None:
+    """
+    One proposed change, with what it is based on and what it would touch.
+
+    Read-only. The card shows the reviewer everything a decision needs -- the source,
+    the approved wording, the proposed wording, the evidence, and the Jira work linked
+    to that requirement in this session's stored mappings -- and offers no control that
+    could act on it. Approving a change is a separate, explicit step.
+    """
+    heading = "{} — {}".format(
+        _CHANGE_HEADINGS.get(change.change_type, change.change_type),
+        change.requirement_id or "new requirement",
+    )
+    with st.expander(heading, expanded=change.change_type != "UNCHANGED"):
+        st.markdown(
+            "**Source:** {}{}".format(
+                change.source_label,
+                " — {}".format(change.source_reference) if change.source_reference else "",
+            )
+        )
+
+        if change.old_text:
+            st.markdown("**Approved requirement (old):** {}".format(change.old_text))
+        elif change.change_type == "NEW":
+            st.caption(
+                "Not in the approved BRD. The id above is proposed for it, not one the "
+                "detector chose."
+            )
+
+        if change.proposed_new_text:
+            st.markdown("**Proposed requirement (new):** {}".format(change.proposed_new_text))
+
+        if change.is_from_jira:
+            if change.jira_field:
+                st.markdown("**Changed Jira field(s):** {}".format(change.jira_field))
+            if change.previous_value:
+                st.markdown("**Jira value before:**\n```text\n{}\n```".format(change.previous_value))
+            if change.jira_current_value:
+                st.markdown("**Current Jira value:**\n```text\n{}\n```".format(change.jira_current_value))
+
+        if change.source_evidence:
+            st.markdown("**Source Evidence:**\n> {}".format(change.source_evidence))
+        else:
+            st.caption(
+                "No evidence from this source could be verified for this change, so "
+                "none is shown."
+            )
+
+        if change.affected_issue_keys:
+            st.markdown(
+                "**Affected Jira issue(s):** "
+                + ", ".join("`{}`".format(key) for key in change.affected_issue_keys)
+            )
+        if change.affected_plan_keys:
+            st.markdown(
+                "**Affected planned item(s):** "
+                + ", ".join("`{}`".format(key) for key in change.affected_plan_keys)
+            )
+        if not (change.affected_issue_keys or change.affected_plan_keys):
+            st.caption(
+                "No planned or created Jira work is linked to this requirement in this "
+                "session's stored mappings."
+            )
+
+        if change.impact:
+            st.markdown("**Impact:** {}".format(change.impact))
+        if change.proposed_action:
+            st.markdown("**Proposed action:** {}".format(change.proposed_action))
+        if change.confidence:
+            st.caption("Detector confidence: {}".format(change.confidence))
+
+        if change.needs_manual_review:
+            st.warning(
+                change.review_reason
+                or "This change could not be classified confidently and needs a person."
+            )
+
+        st.caption(
+            "Status: {}. Nothing in the BRD or in Jira has been changed.".format(
+                change.approval_state
+            )
+        )
+
+
+def _record_change_decision(changes_key: str, proposal: ChangeProposal, change_id: str, state: str) -> None:
+    """Persist a reviewer decision; this records no BRD or Jira mutation."""
+    st.session_state[changes_key] = decide_change(proposal, change_id, state)
+    st.rerun()
+
+
+def _render_change_decisions(proposal: ChangeProposal, changes_key: str, brd_data: BRDData) -> None:
+    """Explicit review and apply controls shared by meeting and Jira proposals."""
+    for change in proposal.changes:
+        if not change.is_pending:
+            continue
+
+        if change.is_from_jira:
+            # "Accept Jira → BRD" is the approval for a Jira edit. A second, generically
+            # labelled Approve button would record the identical decision, which on a
+            # governance screen reads as a different one.
+            accept, reject, keep = st.columns(3)
+            if accept.button(
+                "Accept Jira → BRD",
+                key="accept_jira_change_{}".format(change.change_id),
+                disabled=not change.is_decidable,
+            ):
+                _record_change_decision(changes_key, proposal, change.change_id, "approved")
+            if reject.button("Reject", key="reject_change_{}".format(change.change_id)):
+                _record_change_decision(changes_key, proposal, change.change_id, "rejected")
+            if keep.button("Keep Jira only", key="keep_jira_change_{}".format(change.change_id)):
+                _record_change_decision(changes_key, proposal, change.change_id, "jira_only")
+        else:
+            approve, reject = st.columns(2)
+            if approve.button(
+                "Approve", key="approve_change_{}".format(change.change_id), disabled=not change.is_decidable
+            ):
+                _record_change_decision(changes_key, proposal, change.change_id, "approved")
+            if reject.button("Reject", key="reject_change_{}".format(change.change_id)):
+                _record_change_decision(changes_key, proposal, change.change_id, "rejected")
+
+    if proposal.approved and st.button("Apply approved changes to BRD", key="apply_requirement_changes"):
+        updated, applied = apply_approved_changes(brd_data, proposal)
+        if not applied:
+            st.warning(
+                "No change was applied because its approved BRD value is no longer current. "
+                "The BRD and Jira were left unchanged."
+            )
+            return
+        # Deliberately not _store_brd: this amends the reviewed BRD rather than replacing
+        # it, so the creation results and the synchronization baseline stay valid. They
+        # record what already exists in Jira, which an approved BRD edit does not undo.
+        # The decided proposal stays too, so the approved and rejected outcome survives
+        # the rerun; apply_approved_changes re-checks each stored value before touching it.
+        st.session_state[BRD_SESSION_KEY] = updated
+        _flash("success", "Applied {} approved requirement change(s) to the BRD.".format(len(applied)))
+        st.rerun()
+
+
+def _render_jira_drift_detection(brd_data: BRDData, changes_key: str) -> None:
+    """Read only the saved Jira issue snapshots and turn direct edits into proposals."""
+    baseline = st.session_state.get(_skey(JIRA_STATE_NAME, "change_baseline"))
+    if not isinstance(baseline, dict) or not baseline:
+        st.caption(
+            "No saved Jira synchronization baseline is available in this session. "
+            "Jira edits are not compared without one."
+        )
+        return
+
+    service = JiraService()
+    tokens = _connected_tokens(service)
+    site = st.session_state.get(_skey(service.name, "site"))
+    if tokens is None or site is None:
+        st.caption(
+            "Connect Jira and select the saved issue's site before checking for direct edits."
+        )
+        return
+
+    issue_keys = tuple(str(key).strip() for key in baseline if str(key).strip())
+    if not issue_keys:
+        st.caption("The saved Jira baseline is malformed, so no issue was checked.")
+        return
+
+    if not st.button("Check Jira for requirement drift", key="detect_jira_drift", type="primary"):
+        return
+
+    current_issues = []
+    failures = []
+    for issue_key in issue_keys:
+        current = _provider_call(
+            service,
+            tokens,
+            lambda token, key=issue_key: service.get_issue_fields(token, site.id, key),
+            "Reading {} from Jira...".format(issue_key),
+        )
+        if isinstance(current, dict):
+            current_issues.append(current)
+        else:
+            failures.append(issue_key)
+
+    st.session_state[changes_key] = detect_jira_changes(
+        brd_data,
+        current_issues,
+        plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
+        created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
+        baseline=baseline,
+        failures=failures,
+    )
+
+
+def _render_requirement_changes_section() -> None:
+    """
+    Compare a later meeting against the approved BRD. Changes nothing.
+
+    Deliberately holds no Jira service and no token, exactly as the work-plan panel
+    does, so "detecting a change creates nothing" is a property of the code rather than
+    a caption. The plan and the creation results are read out of this session only, to
+    report which work a changed requirement is already linked to.
+
+    Every proposal begins pending. A reviewer can explicitly approve, reject, or keep
+    a Jira edit only; applying is a separate button and never writes back to Jira.
+    """
+    st.divider()
+    st.subheader("Requirement changes (optional)")
+
+    brd_data = st.session_state.get(BRD_SESSION_KEY)
+    if not isinstance(brd_data, BRDData):
+        st.caption(
+            "No BRD is available yet. Change detection compares a later meeting against "
+            "approved requirements, so generate a BRD above first."
+        )
+        return
+
+    changes_key = _skey(JIRA_STATE_NAME, "changes")
+
+    st.markdown("**Jira-driven drift**")
+    st.caption(
+        "Compare the current Jira fields with the values saved when these issues were "
+        "created. This is read-only and produces pending proposals."
+    )
+    _render_jira_drift_detection(brd_data, changes_key)
+
+    st.markdown("**Meeting-driven changes**")
+    st.caption(
+        "Each result is a proposal awaiting your approval: detecting and reviewing "
+        "changes nothing in the BRD and nothing in Jira."
+    )
+
+    label = st.radio(
+        "New evidence source",
+        TRANSCRIPT_SOURCES,
+        horizontal=True,
+        key="change_source",
+    )
+    transcript = _new_change_evidence(label)
+
+    if transcript is not None:
+        with st.spinner("Comparing this source against the approved requirements..."):
+            st.session_state[changes_key] = detect_meeting_changes(
+                brd_data,
+                transcript,
+                plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
+                created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
+                generate=_planner_generate(),
+            )
+
+    proposal = st.session_state.get(changes_key)
+    if not isinstance(proposal, ChangeProposal):
+        st.caption("Not run yet. Detecting changes creates nothing and changes nothing.")
+        return
+
+    for note in proposal.notes:
+        st.info(note)
+
+    if proposal.is_empty:
+        st.success("No requirement change was proposed from this source.")
+        return
+
+    pending = len(proposal.pending)
+    review = len(proposal.needing_review)
+    st.markdown(
+        "**{} proposed change(s)**, {} pending your decision{}.".format(
+            len(proposal.changes),
+            pending,
+            ", {} needing manual review".format(review) if review else "",
+        )
+    )
+
+    for change in proposal.changes:
+        _render_requirement_change(change)
+
+    _render_change_decisions(proposal, changes_key, brd_data)
+
+
 def _render_provider_section(provider) -> Optional[NormalizedTranscript]:
     """Full UI for one provider: configuration, auth, discovery, preview, generate."""
     if not provider.is_configured():
@@ -2024,12 +2425,7 @@ _render_flashes()
 # --- Transcript Source Selection ---
 source_option = st.radio(
     "Select Transcript Source",
-    (
-        "Manual Paste",
-        "Upload Transcript File (.txt)",
-        "Google Meet",
-        "Microsoft Teams",
-    ),
+    TRANSCRIPT_SOURCES,
     horizontal=True,
 )
 
@@ -2127,4 +2523,8 @@ if transcript_to_process:
 # it. The only write is issue creation, which requires an explicit confirmation.
 _render_jira_section()
 
-
+# --- Optional Requirement Change Detection ---
+# Compares a later meeting against the approved BRD and reports what it would change.
+# Rendered after Jira so the impact it reports can name the plan and the issues created
+# above. It takes no service and no token, so it cannot write anywhere.
+_render_requirement_changes_section()

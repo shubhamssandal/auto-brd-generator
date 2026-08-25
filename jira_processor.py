@@ -836,6 +836,61 @@ def issue_browse_url(site_url: str, issue_key: str) -> str:
     return "{}/browse/{}".format(site, key) if site and key else ""
 
 
+def issue_description_text(issue: PlannedIssue) -> str:
+    """
+    The description text this app sends to Jira for one proposed issue.
+
+    Acceptance criteria travel inside the description. They have no field of their own
+    on a Jira create screen -- a project that tracks them separately does it with a
+    custom field, and writing to a field this app did not discover would be inventing
+    one.
+
+    Spelled once so JIRA-010 can compare what an issue in Jira currently says against
+    what this app actually sent, rather than against a second guess at the same text.
+    """
+    description = str(issue.description or "")
+    criteria = [str(item).strip() for item in issue.acceptance_criteria if str(item).strip()]
+    if criteria:
+        description = "\n\n".join(
+            [description.strip(), "Acceptance criteria:"] + ["- {}".format(c) for c in criteria]
+        ).strip()
+    return description
+
+
+def adf_to_text(node) -> str:
+    """
+    The plain text of an Atlassian Document Format value, or "" if there is none.
+
+    The inverse of ``_adf`` for the shapes this app writes, and tolerant of the ones
+    it does not: any node carrying ``text`` contributes it, top-level blocks are
+    separated by a blank line. Used to compare a description read back from Jira with
+    the description that was sent -- comparing raw ADF would report a difference every
+    time Jira normalized its own markup.
+    """
+    if isinstance(node, str):
+        return node.strip()
+    if not isinstance(node, dict):
+        return ""
+
+    def collect(item) -> str:
+        if isinstance(item, str):
+            return item
+        if not isinstance(item, dict):
+            return ""
+        if item.get("type") == "text":
+            return str(item.get("text") or "")
+        if item.get("type") == "hardBreak":
+            return "\n"
+        return "".join(collect(child) for child in item.get("content") or [])
+
+    blocks = [collect(block).strip() for block in node.get("content") or []]
+    kept = [block for block in blocks if block]
+    if kept:
+        return "\n\n".join(kept)
+    # A doc with no recognised blocks may still be a bare text node.
+    return collect(node).strip()
+
+
 def issue_creation_payload(
     issue: PlannedIssue,
     project_id_or_key: str,
@@ -848,18 +903,8 @@ def issue_creation_payload(
     only the caller can know, so it is passed in rather than read off the plan: the
     plan holds plan-local keys, and sending one of those as a parent would name an
     issue that does not exist in Jira.
-
-    Acceptance criteria travel inside the description. They have no field of their own
-    on a Jira create screen -- a project that tracks them separately does it with a
-    custom field, and writing to a field this app did not discover would be inventing
-    one.
     """
-    description = str(issue.description or "")
-    criteria = [str(item).strip() for item in issue.acceptance_criteria if str(item).strip()]
-    if criteria:
-        description = "\n\n".join(
-            [description.strip(), "Acceptance criteria:"] + ["- {}".format(c) for c in criteria]
-        ).strip()
+    description = issue_description_text(issue)
 
     fields: dict = {
         "project": {"id" if str(project_id_or_key).isdigit() else "key": str(project_id_or_key)},
