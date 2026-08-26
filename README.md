@@ -1,6 +1,12 @@
-# Auto-BRD Generator from Meeting Notes
+# AI-Assisted Software Delivery Lifecycle
 
-This project is a Streamlit web application that converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), optionally delivers the reviewed requirements into Jira as traceable issues, and then detects when those requirements change — in a later meeting or directly in Jira — without applying anything until a reviewer approves it. It is designed as a portfolio piece to demonstrate skills in business analysis, requirements engineering, and the responsible application of Large Language Models (LLMs).
+This project is a Streamlit web application for an AI-assisted software delivery lifecycle:
+
+> **Discovery → BRD → PRD → Architecture → Implementation Plan → Sprint Planning → Test Cases → Test Execution → Jira / Delivery Status**
+
+Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD) and optionally delivers the reviewed requirements into Jira as traceable issues. The stages between the BRD and Jira delivery — PRD, architecture, implementation plan, sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [Project Delivery Lifecycle](#project-delivery-lifecycle) for exactly what is built and what is planned.
+
+It is designed as a portfolio piece to demonstrate skills in business analysis, requirements engineering, and the responsible application of Large Language Models (LLMs).
 
 ## The Problem It Solves
 
@@ -14,7 +20,7 @@ The application's most important feature is its commitment to traceability. It w
 - **Assumptions** are clearly flagged when the AI makes a logical inference that isn't explicitly stated.
 - **Open Questions** are captured to highlight ambiguities and items needing follow-up.
 
-The same rule applies to people. A speaker's role is recorded only when the transcript actually states it: `Priya (PM): ...` yields *Priya — PM*, while `Priya: ...` yields *Priya* with no role. Roles, participants, meeting titles and dates are never inferred — when a source does not supply them, the field stays empty and the UI says so.
+The same rule applies to people. A speaker's role is recorded only when the transcript actually states it: `Priya (PM): ...` yields _Priya — PM_, while `Priya: ...` yields _Priya_ with no role. Roles, participants, meeting titles and dates are never inferred — when a source does not supply them, the field stays empty and the UI says so.
 
 ## Architecture and Data Flow
 
@@ -45,32 +51,28 @@ All four ingestion sources normalize into one `NormalizedTranscript` and then fl
         Optional Jira delivery  (OAuth 2.0 3LO + Atlassian REST)
         site → project → required fields → work plan → review
                  → explicit confirmation → issue creation
-                                ▼
-              Requirement Change Detection & Governance
-        later meeting OR direct Jira edit → proposed changes
-                 → explicit approval → BRD amendment
 ```
 
 Everything after the Markdown export is optional. A BRD is complete without it, and nothing is written to Jira until a reviewer confirms.
 
 ### Module map
 
-| File | Responsibility |
-| --- | --- |
-| `main.py` | Streamlit UI, OAuth callback handling, Gemini call, evidence validation, Markdown export, Jira and change-review panels |
-| `brd_models.py` | `NormalizedTranscript` and the BRD dataclasses |
-| `transcript_processor.py` | Manual-paste and `.txt` upload normalization |
-| `providers/base.py` | `TranscriptProvider` contract and the provider error hierarchy |
-| `providers/oauth_state.py` | Signed CSRF state + PKCE handshake values |
-| `providers/session_tokens.py` | `TokenSet`, expiry-aware refresh, retry-on-401 |
-| `providers/google_meet.py` | Google Meet API v2 + Drive export adaptor |
-| `providers/ms_teams.py` | Microsoft Graph adaptor and WebVTT parsing |
-| `jira_config.py` | Jira client configuration read from the environment |
-| `jira_service.py` | Jira OAuth 2.0 (3LO), accessible sites, projects, create-metadata, issue creation, single-issue reads |
-| `jira_models.py` | `PlannedIssue`, `JiraWorkPlan`, `CreatedIssue`, `RequirementChange`, `ChangeProposal` |
-| `jira_processor.py` | Deterministic BRD → work-plan mapping, plan validation, ADF conversion |
-| `jira_planner.py` | Optional AI hierarchy planning, validated deterministically before use |
-| `jira_change_detector.py` | Requirement-change detection from a later meeting or from Jira drift, plus the approval gate |
+| File                          | Responsibility                                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `main.py`                     | Streamlit UI, OAuth callback handling, Gemini call, evidence validation, Markdown export, Jira panel, lifecycle workspace |
+| `lifecycle_models.py`         | Delivery lifecycle stages, states, and `lifecycle_from` derivation from session artifacts                                 |
+| `brd_models.py`               | `NormalizedTranscript` and the BRD dataclasses                                                                            |
+| `transcript_processor.py`     | Manual-paste and `.txt` upload normalization                                                                              |
+| `providers/base.py`           | `TranscriptProvider` contract and the provider error hierarchy                                                            |
+| `providers/oauth_state.py`    | Signed CSRF state + PKCE handshake values                                                                                 |
+| `providers/session_tokens.py` | `TokenSet`, expiry-aware refresh, retry-on-401                                                                            |
+| `providers/google_meet.py`    | Google Meet API v2 + Drive export adaptor                                                                                 |
+| `providers/ms_teams.py`       | Microsoft Graph adaptor and WebVTT parsing                                                                                |
+| `jira_config.py`              | Jira client configuration read from the environment                                                                       |
+| `jira_service.py`             | Jira OAuth 2.0 (3LO), accessible sites, projects, create-metadata, issue creation                                         |
+| `jira_models.py`              | `PlannedIssue`, `JiraWorkPlan`, `CreatedIssue`                                                                            |
+| `jira_processor.py`           | Deterministic BRD → work-plan mapping, plan validation, ADF conversion                                                    |
+| `jira_planner.py`             | Optional AI hierarchy planning, validated deterministically before use                                                    |
 
 ## Ingestion Modes and Their Real Status
 
@@ -168,34 +170,9 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 - **Connection.** Jira uses the same OAuth 2.0 session and token handling as the transcript providers: a signed single-use `state`, expiry-aware refresh, and one retry on `401`. PKCE is deliberately not sent, because Atlassian's 3LO flow documents only `audience`, `client_id`, `scope`, `redirect_uri`, `state`, `response_type` and `prompt`. The requested scopes are `read:me`, `read:jira-user`, `read:jira-work`, `write:jira-work` and `offline_access` — the write scope only because issue creation needs it.
 - **Work plan.** `jira_processor.build_work_plan` maps confirmed requirements and action items onto the project's real issue types. Hierarchy grouping may be proposed by Gemini through `jira_planner`, but the model's output is treated as untrusted: `validate_work_plan` rejects unknown issue types, invalid parent/child levels, self-parents, cycles, duplicate keys and invalid subtasks, and the deterministic mapping is used when the model is unavailable or its answer fails validation.
 - **Review before writing.** Every proposed issue is editable and individually selectable, and creation is behind a two-step confirmation. A page load, a rerun or a regenerated plan sends no request.
-- **Creation and traceability.** Issues are created parents-first so children can reference real keys. Each result is stored as a `CreatedIssue` linking `issue_key` back to the `plan_key`, the source requirement ids and the source action-item ids — the mapping the change-detection step later reads.
-
-## Requirement Change Detection and Governance
-
-Requirements move after a BRD is signed off: a later call changes one, or someone edits the Jira issue directly. Both are detected, and neither is applied on its own.
-
-**Two detection paths, one model.** Both produce `RequirementChange` objects classified as `NEW`, `CHANGED`, `REMOVED_DEFERRED`, `UNCHANGED` or `UNCLEAR`.
-
-1. **A later meeting.** Any of the four existing sources (manual paste, `.txt` upload, Google Meet, Microsoft Teams) can be compared against the approved BRD. Gemini proposes the comparison; Python validates it. Requirement ids the BRD does not contain are dropped, `old_text` is always re-read from the stored BRD rather than trusted from the model, and a quote that cannot be found verbatim in the new transcript is cleared and the change flagged for manual review.
-2. **Direct Jira edits (drift).** After a creation run the app stores an immutable snapshot of exactly what was sent to Jira. **Check Jira for requirement drift** re-reads only those issues' `summary` and `description`, flattens Jira's ADF to text, and compares whitespace-normalized text so Jira's own markup normalization is not reported as a change. An issue with no snapshot, or one linked to more than one requirement, is reported for manual handling instead of becoming an approvable change.
-
-**Nothing is applied automatically.** Every proposal starts `pending`. Detection and review mutate neither the BRD nor Jira.
-
-| Decision | Effect |
-| --- | --- |
-| **Approve** (meeting change) | Marks the change approved. Still applies nothing on its own. |
-| **Accept Jira → BRD** (drift) | Marks the Jira value as the one to adopt into the BRD. |
-| **Reject** | Records the rejection. The BRD keeps its current value. |
-| **Keep Jira only** (drift) | Records that Jira's value stands without amending the BRD. |
-| **Apply approved changes to BRD** | The only mutation. Writes approved, applicable changes into the BRD. |
-
-- Applying re-checks each requirement's current text first, so an approval that has gone stale is skipped and reported rather than overwriting newer content.
-- `UNCLEAR` changes and changes flagged for manual review cannot be approved at all.
-- **This step writes nothing to Jira.** Approving a drift change amends the BRD and shows which Jira issues are affected; changing Jira remains a separate, manual decision.
-- Impact is read from the stored `CreatedIssue`/plan mapping only, never guessed, and applying a change leaves that mapping intact so a requirement keeps its link to the work already created for it.
+- **Creation and traceability.** Issues are created parents-first so children can reference real keys. Each result is stored as a `CreatedIssue` linking `issue_key` back to the `plan_key`, the source requirement ids and the source action-item ids — preserving full traceability from Jira back to the originating BRD requirement.
 
 ## Credential and Token Handling
-
 
 - All credentials come from environment variables loaded from `.env`. Nothing is hardcoded.
 - `.env` is git-ignored (along with `brd-env/` and `.streamlit/secrets.toml`). Only `.env.example`, which contains variable **names** and no values, is tracked.
@@ -240,9 +217,9 @@ Requirements move after a BRD is signed off: a later call changes one, or someon
    ./brd-env/bin/streamlit run main.py
    ```
 
-5. **Connect a provider (optional):** choose *Google Meet* or *Microsoft Teams*, click **Connect**, authorize on the provider's own sign-in page, and you are returned to the app. Then use **Retrieve available meetings & transcripts**, pick a meeting from the list, **Load transcript**, review the preview, and press **Generate BRD from this transcript**.
+5. **Connect a provider (optional):** choose _Google Meet_ or _Microsoft Teams_, click **Connect**, authorize on the provider's own sign-in page, and you are returned to the app. Then use **Retrieve available meetings & transcripts**, pick a meeting from the list, **Load transcript**, review the preview, and press **Generate BRD from this transcript**.
 
-6. **Deliver to Jira (optional):** with a BRD on screen, connect Jira (`JIRA_CLIENT_ID` / `JIRA_CLIENT_SECRET` required), pick a site and project, read the required-field report, **Generate Jira Work Plan**, edit and select the issues you want, then confirm creation. Afterwards, the **Requirement changes** panel offers **Detect requirement changes** for a later meeting and **Check Jira for requirement drift** for the issues that were created. Both stop at proposals until you approve them.
+6. **Deliver to Jira (optional):** with a BRD on screen, connect Jira (`JIRA_CLIENT_ID` / `JIRA_CLIENT_SECRET` required), pick a site and project, read the required-field report, **Generate Jira Work Plan**, edit and select the issues you want, then confirm creation.
 
 ## How to Test
 
@@ -250,40 +227,40 @@ Requirements move after a BRD is signed off: a later call changes one, or someon
 ./brd-env/bin/pytest -q
 ```
 
-**Last run: 498 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
+**Last run: 497 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
 
-| File | Covers |
-| --- | --- |
-| `test_main.py` | Evidence validation and re-classification, BRD assembly, Markdown formatting |
-| `test_transcript_ingestion.py` | Manual/upload normalization, provider configuration reporting, token exchange, VTT parsing, four-source pipeline |
-| `test_oauth_security.py` | Signed state round-trip, forged/tampered/expired/wrong-provider state, PKCE S256 derivation, `TokenSet` expiry and redaction, proactive and reactive refresh |
-| `test_providers_google.py` | Authorization URL, PKCE verifier submission, HTTP→error mapping, pagination and truncation reporting, discovery, participant-name resolution, `Speaker N` placeholders, Drive fallback, refresh-and-retry |
-| `test_providers_teams.py` | Least-privileged delegated scopes, join-URL resolution, calendar discovery and `@odata.nextLink` paging, VTT speaker parsing, `SpeakerAttributionNotAllowed` fallback, `GraphAccessToTranscriptsDisabled`, admin-consent `403`, refresh-and-retry |
-| `test_main_integration.py` | OAuth denial, forged-state rejection, verified callback, missing refresh token, exchange failure, disconnect, additive `NormalizedTranscript` fields, provider transcripts through the shared validation pipeline, no invented stakeholder roles |
-| `test_jira_config.py` | Jira configuration read from the environment and unconfigured reporting by variable name |
-| `test_jira_oauth.py` | Jira authorization URL, audience and scopes, token exchange, refresh and error mapping |
-| `test_jira_sites.py` | Accessible-resources reads, site selection and state clearing |
-| `test_jira_projects.py` | Project discovery, paging, issue types and create-metadata reporting |
-| `test_jira_work_plan.py` | Deterministic BRD → work-plan mapping, requirement and action-item traceability, plan validation |
-| `test_jira_planner.py` | AI hierarchy planning treated as untrusted: malformed output, invalid hierarchies, cycles, and fallback to the deterministic mapping |
-| `test_jira_work_plan_review.py` | Plan editing, per-issue selection, review-state invalidation when the plan or target changes |
-| `test_jira_creation.py` | Confirmation gating, parents-before-children ordering, partial-failure reporting, `CreatedIssue` mapping, no request on a rerun |
-| `test_jira_change_detection.py` | Baseline capture, Jira summary and ADF description drift, no-drift, read failure, malformed response, missing mapping, meeting-change validation and fabricated-evidence rejection, approve/reject/`jira_only` gating, stale-approval refusal, traceability preserved after applying |
+| File                            | Covers                                                                                                                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_main.py`                  | Evidence validation and re-classification, BRD assembly, Markdown formatting                                                                                                                                                                      |
+| `test_transcript_ingestion.py`  | Manual/upload normalization, provider configuration reporting, token exchange, VTT parsing, four-source pipeline                                                                                                                                  |
+| `test_oauth_security.py`        | Signed state round-trip, forged/tampered/expired/wrong-provider state, PKCE S256 derivation, `TokenSet` expiry and redaction, proactive and reactive refresh                                                                                      |
+| `test_providers_google.py`      | Authorization URL, PKCE verifier submission, HTTP→error mapping, pagination and truncation reporting, discovery, participant-name resolution, `Speaker N` placeholders, Drive fallback, refresh-and-retry                                         |
+| `test_providers_teams.py`       | Least-privileged delegated scopes, join-URL resolution, calendar discovery and `@odata.nextLink` paging, VTT speaker parsing, `SpeakerAttributionNotAllowed` fallback, `GraphAccessToTranscriptsDisabled`, admin-consent `403`, refresh-and-retry |
+| `test_main_integration.py`      | OAuth denial, forged-state rejection, verified callback, missing refresh token, exchange failure, disconnect, additive `NormalizedTranscript` fields, provider transcripts through the shared validation pipeline, no invented stakeholder roles  |
+| `test_jira_config.py`           | Jira configuration read from the environment and unconfigured reporting by variable name                                                                                                                                                          |
+| `test_jira_oauth.py`            | Jira authorization URL, audience and scopes, token exchange, refresh and error mapping                                                                                                                                                            |
+| `test_jira_sites.py`            | Accessible-resources reads, site selection and state clearing                                                                                                                                                                                     |
+| `test_jira_projects.py`         | Project discovery, paging, issue types and create-metadata reporting                                                                                                                                                                              |
+| `test_jira_work_plan.py`        | Deterministic BRD → work-plan mapping, requirement and action-item traceability, plan validation                                                                                                                                                  |
+| `test_jira_planner.py`          | AI hierarchy planning treated as untrusted: malformed output, invalid hierarchies, cycles, and fallback to the deterministic mapping                                                                                                              |
+| `test_jira_work_plan_review.py` | Plan editing, per-issue selection, review-state invalidation when the plan or target changes                                                                                                                                                      |
+| `test_jira_creation.py`         | Confirmation gating, parents-before-children ordering, partial-failure reporting, `CreatedIssue` mapping, no request on a rerun                                                                                                                   |
+| `test_lifecycle_workspace.py`   | Lifecycle stage ordering, state vocabulary enforcement, derived status from session artifacts, workspace rendering, JIRA-010 removal assertions                                                                                                   |
 
 ## What Has Actually Been Verified
 
-| Area | Status |
-| --- | --- |
-| Manual Paste → BRD → Markdown export | Working; exercised in the app and covered by tests |
-| TXT Upload → BRD → Markdown export | Working; exercised in the app and covered by tests |
-| Evidence validation and demotion to Assumption | Working; covered by tests |
-| Google Meet / Teams provider code paths | Implemented and covered by tests against mocked API responses |
-| OAuth state, PKCE, token refresh and retry logic | Covered by tests |
-| Jira work-plan generation, validation, review and confirmation gating | Covered by tests; no network involved in building or reviewing a plan |
-| Requirement change detection, approval gating and BRD amendment | Covered by tests, including that detection and rejection mutate nothing |
-| **Live Google Meet transcript retrieval** | **Not verified.** Requires real `GOOGLE_WORKSPACE_*` credentials and a Google Workspace account with Meet transcription enabled. |
-| **Live Microsoft Teams transcript retrieval** | **Not verified.** Requires a real Entra ID app registration, `AZURE_*` credentials, and tenant admin consent. |
-| **Live Jira issue creation and drift reads** | **Not verified in this repository.** All Jira tests run against mocked Atlassian responses; a real end-to-end run needs a Jira Cloud site and an app with the five scopes granted. |
+| Area                                                                  | Status                                                                                                                                                                             |
+| --------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual Paste → BRD → Markdown export                                  | Working; exercised in the app and covered by tests                                                                                                                                 |
+| TXT Upload → BRD → Markdown export                                    | Working; exercised in the app and covered by tests                                                                                                                                 |
+| Evidence validation and demotion to Assumption                        | Working; covered by tests                                                                                                                                                          |
+| Google Meet / Teams provider code paths                               | Implemented and covered by tests against mocked API responses                                                                                                                      |
+| OAuth state, PKCE, token refresh and retry logic                      | Covered by tests                                                                                                                                                                   |
+| Jira work-plan generation, validation, review and confirmation gating | Covered by tests; no network involved in building or reviewing a plan                                                                                                              |
+| Lifecycle workspace: all 8 stages, derived status, no JIRA-010 drift  | Covered by `test_lifecycle_workspace.py`                                                                                                                                           |
+| **Live Google Meet transcript retrieval**                             | **Not verified.** Requires real `GOOGLE_WORKSPACE_*` credentials and a Google Workspace account with Meet transcription enabled.                                                   |
+| **Live Microsoft Teams transcript retrieval**                         | **Not verified.** Requires a real Entra ID app registration, `AZURE_*` credentials, and tenant admin consent.                                                                      |
+| **Live Jira issue creation**                                          | **Not verified in this repository.** All Jira tests run against mocked Atlassian responses; a real end-to-end run needs a Jira Cloud site and an app with the five scopes granted. |
 
 ## Limitations and Technical Considerations
 
@@ -294,9 +271,6 @@ Requirements move after a BRD is signed off: a later call changes one, or someon
 - **Discovery is bounded and says so.** To avoid long scans, the most recent conference records / calendar events are probed, and anything skipped is reported in the UI. Nothing is truncated silently.
 - **Verbatim evidence check.** Validation uses exact substring containment, so a paraphrased quote is demoted to an Assumption even when the underlying point is real.
 - **Stateless operation.** Nothing is persisted between sessions; tokens vanish when the session ends and BRD drafts are downloaded as Markdown.
-- **Jira drift detection is session-scoped.** The comparison baseline is the snapshot captured when the issues were created, held in server-side session state. Restart the app, or generate a new BRD, and there is nothing left to compare against — the panel says so rather than guessing.
-- **Change governance amends the BRD only.** Approving a Jira drift change updates the BRD and lists the affected issues; it never writes back to Jira. There is no bidirectional sync engine.
-- **One requirement per issue for approvable drift.** An issue linked to several requirements, or edited only in prose the app cannot attribute to a single requirement, is reported for manual review instead of becoming an approvable change.
-- **A stale plan is tolerated, not corrected.** After a requirement is amended, a previously generated work plan still restates the older wording until it is regenerated.
+- **A stale plan is tolerated, not corrected.** After a BRD is regenerated, a previously generated work plan still restates the older wording until it is regenerated.
 - **OAuth state does not survive a restart** unless `OAUTH_STATE_SECRET` is set, because the signing key is otherwise generated per process. An in-flight sign-in must be restarted.
 - **Prompt sensitivity.** Output quality is bounded by the clarity and completeness of the source notes.
