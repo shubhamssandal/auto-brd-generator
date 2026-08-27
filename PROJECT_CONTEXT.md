@@ -342,6 +342,16 @@ Structured BRD generation
 BRD displayed to the user
         ↓
 BRD export
+        ↓
+Explicit BRD approval → PRD → review/edit → approval
+        ↓
+Explicit PRD approval → Architecture → review/edit → approval
+        ↓
+Explicit architecture approval → Implementation Plan
+(epics → stories → technical tasks) → review/edit → approval
+        ↓
+Later stages (Jira delivery of the plan, sprint planning, test
+cases, test execution, coding agent) — not implemented yet
 ```
 
 ---
@@ -361,18 +371,37 @@ Validation logic should remain simple, transparent, and easy to explain during a
 The MVP should prioritize reliability and traceability over unnecessary AI complexity.
 
 Traceability in the later lifecycle stages reuses the identifiers the previous artifact
-already minted: a PRD feature names BRD requirement ids, and an architecture component
-names PRD feature ids. No stage introduces a second identifier scheme.
+already minted: a PRD feature names BRD requirement ids, an architecture component names
+PRD feature ids, and an implementation-plan story names PRD feature ids and architecture
+component ids. No stage introduces a second identifier scheme.
 
-Traceability is enforced differently for the PRD and the architecture, deliberately. A PRD
-feature that names no BRD requirement is invented product scope and is dropped. An
-architecture component that names no PRD feature is *kept* and counted in the artifact's
-notes, because an API gateway, a shared auth service or a CI pipeline is genuinely
-cross-cutting and dropping it would delete real technical design.
+Traceability is enforced differently at each stage, deliberately, and the rule is the same
+one every time: *does the untraceable item represent invented scope, or real cross-cutting
+work?* A PRD feature that names no BRD requirement is invented product scope and is
+dropped. An architecture component that names no PRD feature is *kept* and counted in the
+artifact's notes, because an API gateway, a shared auth service or a CI pipeline is
+genuinely cross-cutting and dropping it would delete real technical design. An
+implementation-plan story that names no PRD feature is invented scope and is dropped, with
+a note telling the reviewer to re-add it as a task if it was real technical work; a *task*
+that names no architecture component is kept, because repository setup or a release step
+touches no single component.
 
 An architecture component's layer (backend, web, mobile) is determined by the section of
 the model response it arrived in, never by a layer the model asserts about itself. Only a
 component in a generic list has its layer inferred, and the inference is recorded.
+
+The implementation plan is deliberately not tracker-shaped. `jira_models.PlannedIssue` is
+bound to a selected Jira project's issue types, hierarchy levels and required fields, so it
+cannot exist at this stage of the lifecycle. `implementation_plan_models.ImplementationPlan`
+is the tracker-agnostic engineering structure; a later stage maps one onto the other. The
+two models are separate on purpose and must not be merged.
+
+A model proposal is repaired deterministically rather than re-prompted. Unknown upstream
+ids, references to an epic that is not in the plan, self-dependencies, dependencies that
+match no story, dependency cycles and priorities outside the vocabulary are all fixed by
+ordinary code, and every repair is recorded in the artifact's notes so a reviewer reads
+what changed instead of trusting the result. Cycle breaking removes only the closing link,
+so the work stays startable.
 
 ---
 

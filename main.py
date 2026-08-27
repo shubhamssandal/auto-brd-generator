@@ -25,11 +25,22 @@ from transcript_processor import (
 from jira_models import CreatedIssue
 from architecture_generator import generate_architecture
 from architecture_models import LAYERS, LAYER_LABEL, ArchitectureData
+from implementation_plan_generator import (
+    break_dependency_cycles,
+    generate_implementation_plan,
+)
+from implementation_plan_models import (
+    DEFAULT_PRIORITY,
+    PRIORITIES,
+    ImplementationPlan,
+    component_index,
+)
 from lifecycle_models import (
     APPROVED,
     ARCHITECTURE,
     DELIVERY_STATUS,
     DISCOVERY_BRD,
+    IMPLEMENTATION_PLAN,
     IMPLEMENTED_STAGES,
     LIFECYCLE_STAGES,
     PRD,
@@ -670,11 +681,40 @@ ARCHITECTURE_DISCUSSION_SESSION_KEY = "architecture_discussion"
 # reason as the PRD's.
 _ARCH_WIDGET_PREFIX = "arch_review__"
 
+# The implementation plan derived from the approved PRD and architecture, and whether the
+# reviewer approved it. No transcript here: the plan is a decomposition of two approved
+# artifacts, and a fourth meeting would add opinion rather than evidence.
+IMPLEMENTATION_PLAN_SESSION_KEY = "implementation_plan_data"
+IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY = "implementation_plan_approved"
+
+# Widget keys for the implementation plan review editors, under their own prefix for the
+# same reason as the PRD's and the architecture's.
+_PLAN_WIDGET_PREFIX = "plan_review__"
+
 
 def _clear_prd_widgets() -> None:
     """Drop PRD review-editor widget state."""
     for key in list(st.session_state.keys()):
         if str(key).startswith(_PRD_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_implementation_plan_state() -> None:
+    """
+    Forget the implementation plan, its approval and its editors.
+
+    Called when the architecture changes, for the reason the architecture is cleared when
+    the PRD changes: a plan decomposes one specific design, so a new design makes a held
+    plan wrong rather than merely old, and its approval cannot carry over to work nobody
+    has reviewed.
+    """
+    for key in (
+        IMPLEMENTATION_PLAN_SESSION_KEY,
+        IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_PLAN_WIDGET_PREFIX):
             st.session_state.pop(key, None)
 
 
@@ -684,7 +724,8 @@ def _clear_architecture_state() -> None:
 
     Called when the PRD changes for the same reason ``_clear_prd_state`` is called when
     the BRD changes: an architecture is the design for one specific PRD, so a new PRD
-    makes a held architecture wrong rather than merely old.
+    makes a held architecture wrong rather than merely old. The implementation plan
+    decomposed from that architecture goes with it.
     """
     for key in (
         ARCHITECTURE_SESSION_KEY,
@@ -695,6 +736,7 @@ def _clear_architecture_state() -> None:
     for key in list(st.session_state.keys()):
         if str(key).startswith(_ARCH_WIDGET_PREFIX):
             st.session_state.pop(key, None)
+    _clear_implementation_plan_state()
 
 
 def _clear_prd_state() -> None:
@@ -2804,13 +2846,425 @@ def _render_architecture_stage(lifecycle) -> None:
 
     architecture = _render_architecture_editor(architecture)
     st.caption(
-        "Approving records that you reviewed this architecture. Later stages -- "
-        "implementation plan, sprints and tests -- are not implemented yet, so nothing "
-        "downstream is generated."
+        "Approving records that you reviewed this architecture, and unlocks the "
+        "Implementation Plan stage. Nothing is created in Jira, and the sprint and test "
+        "stages after it are not implemented yet."
     )
     if st.button("Approve architecture", key="approve_architecture"):
         st.session_state[ARCHITECTURE_APPROVED_SESSION_KEY] = True
         _flash("success", "Architecture approved.")
+
+
+def _architecture_approved() -> bool:
+    return bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY))
+
+
+def _held_implementation_plan():
+    plan = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    return plan if isinstance(plan, ImplementationPlan) else None
+
+
+def _persist_implementation_plan(plan: ImplementationPlan) -> ImplementationPlan:
+    st.session_state[IMPLEMENTATION_PLAN_SESSION_KEY] = plan
+    return plan
+
+
+def _render_plan_traceability(
+    plan: ImplementationPlan, prd: PRDData, architecture: ArchitectureData
+) -> None:
+    """
+    What this plan builds, what it leaves unbuilt, and whether it is stale.
+
+    Two coverage questions, not one: an uncovered PRD feature means the plan does not
+    deliver approved product behaviour, and an uncovered architecture component means the
+    plan does not build a part of the approved design. They fail differently, so they are
+    reported separately.
+    """
+    st.caption(
+        "Traceability: {} of {} PRD feature(s) delivered, {} of {} architecture "
+        "component(s) built — {} epic(s), {} story/stories, {} task(s)".format(
+            len(plan.covered_feature_ids),
+            len(plan.source_feature_ids),
+            len(plan.covered_component_ids),
+            len(plan.source_component_ids),
+            len(plan.epics),
+            len(plan.stories),
+            plan.task_count,
+        )
+    )
+    if plan.uncovered_feature_ids:
+        st.warning(
+            "Not delivered by any story: {}. Either that is deliberate, or the plan is "
+            "incomplete.".format(", ".join(plan.uncovered_feature_ids))
+        )
+    if plan.uncovered_component_ids:
+        st.warning(
+            "Not built by any story or task: {}. The approved design promises these "
+            "components.".format(", ".join(plan.uncovered_component_ids))
+        )
+    unready = plan.unready_stories
+    if unready:
+        st.warning(
+            "{} story/stories are not ready to implement: {}.".format(
+                len(unready),
+                "; ".join(
+                    "{} ({})".format(story.story_id, ", ".join(story.readiness_gaps))
+                    for story in unready[:5]
+                ),
+            )
+        )
+    if tuple(feature.feature_id for feature in prd.features) != tuple(plan.source_feature_ids):
+        st.warning(
+            "The PRD's features changed after this plan was generated. Regenerate it so "
+            "the work matches the approved PRD."
+        )
+    if tuple(
+        component.component_id for component in architecture.components
+    ) != tuple(plan.source_component_ids):
+        st.warning(
+            "The architecture's components changed after this plan was generated. "
+            "Regenerate it so the work matches the approved design."
+        )
+
+
+def _plan_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(label, value=_criteria_text(values), key=_PLAN_WIDGET_PREFIX + suffix)
+    )
+
+
+def _plan_priority(current: str, suffix: str) -> str:
+    """A priority chosen from the vocabulary, so an unorderable value cannot be typed."""
+    options = list(PRIORITIES)
+    index = options.index(current) if current in options else options.index(DEFAULT_PRIORITY)
+    return st.selectbox(
+        "Priority", options, index=index, key=_PLAN_WIDGET_PREFIX + suffix
+    )
+
+
+def _plan_components(current, choices: list, suffix: str) -> tuple:
+    """
+    Architecture components chosen from a list rather than typed.
+
+    Offered as a choice because a component id typed by hand can name a component the
+    approved design does not contain, which is exactly the traceability the generator
+    spends its notes protecting.
+    """
+    if not choices:
+        return tuple(current)
+    selected = st.multiselect(
+        "Architecture components",
+        choices,
+        default=[value for value in current if value in choices],
+        key=_PLAN_WIDGET_PREFIX + suffix,
+    )
+    return tuple(selected)
+
+
+def _render_plan_story_editor(story, component_choices: list, story_choices: list):
+    """One story's editable fields, including its technical tasks."""
+    st.caption(
+        "Delivers PRD feature(s): {} · {}".format(
+            ", ".join(story.feature_ids) or "none",
+            "ready to implement" if story.is_ready else "not ready: " + ", ".join(story.readiness_gaps),
+        )
+    )
+    title = st.text_input(
+        "Story title", value=story.title, key="{}{}_title".format(_PLAN_WIDGET_PREFIX, story.story_id)
+    )
+    user_story = st.text_area(
+        "User story",
+        value=story.user_story,
+        key="{}{}_user_story".format(_PLAN_WIDGET_PREFIX, story.story_id),
+        help="As a <role>, I want <capability> so that <benefit>.",
+    )
+    criteria = _plan_lines(
+        "Acceptance criteria (one per line)",
+        story.acceptance_criteria,
+        "{}_criteria".format(story.story_id),
+    )
+    priority = _plan_priority(story.priority, "{}_priority".format(story.story_id))
+    components = _plan_components(
+        story.component_ids, component_choices, "{}_components".format(story.story_id)
+    )
+    others = [value for value in story_choices if value != story.story_id]
+    depends_on = tuple(
+        st.multiselect(
+            "Depends on (stories that must be delivered first)",
+            others,
+            default=[value for value in story.depends_on if value in others],
+            key="{}{}_depends".format(_PLAN_WIDGET_PREFIX, story.story_id),
+        )
+    )
+    expectations = _plan_lines(
+        "Test expectations (one per line)",
+        story.test_expectations,
+        "{}_tests".format(story.story_id),
+    )
+    estimate = st.text_input(
+        "Estimate",
+        value=story.estimate,
+        key="{}{}_estimate".format(_PLAN_WIDGET_PREFIX, story.story_id),
+    )
+
+    tasks = []
+    for task in story.tasks:
+        st.markdown("**{} — {}**".format(task.label, task.task_id))
+        tasks.append(
+            replace(
+                task,
+                title=st.text_input(
+                    "Task title",
+                    value=task.title,
+                    key="{}{}_title".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+                detail=st.text_area(
+                    "Task detail",
+                    value=task.detail,
+                    key="{}{}_detail".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+                component_ids=_plan_components(
+                    task.component_ids, component_choices, "{}_components".format(task.task_id)
+                ),
+                estimate=st.text_input(
+                    "Task estimate",
+                    value=task.estimate,
+                    key="{}{}_estimate".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+            )
+        )
+
+    return replace(
+        story,
+        title=title,
+        user_story=user_story,
+        acceptance_criteria=criteria,
+        priority=priority,
+        component_ids=components,
+        depends_on=depends_on,
+        test_expectations=expectations,
+        estimate=estimate,
+        tasks=tuple(tasks),
+    )
+
+
+def _render_plan_editor(
+    plan: ImplementationPlan, architecture: ArchitectureData
+) -> ImplementationPlan:
+    """
+    The review and edit surface: every edit is kept, and none of them approves anything.
+
+    Feature ids are shown but not editable, for the reason the architecture editor does not
+    let feature ids be typed over: traceability is derived from the artifact upstream, so
+    letting it be rewritten here would let a reviewer claim coverage the PRD does not
+    support. Component ids and dependencies *are* editable, because those are engineering
+    decisions -- but they are chosen from a list, so neither can name something that does
+    not exist.
+    """
+    overview = st.text_area(
+        "Plan overview and sequencing",
+        value=plan.overview,
+        key=_PLAN_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    component_choices = list(plan.source_component_ids) or list(
+        component_index(architecture).keys()
+    )
+    story_choices = [story.story_id for story in plan.stories]
+
+    epics = []
+    stories: list = []
+    edited_story_ids: set = set()
+    for epic in plan.epics:
+        under = plan.stories_for(epic.epic_id)
+        with st.expander(
+            "{} — {} ({} story/stories)".format(epic.epic_id, epic.name, len(under)),
+            expanded=False,
+        ):
+            st.caption(
+                "Delivers PRD feature(s): {}".format(", ".join(epic.feature_ids) or "none")
+            )
+            epics.append(
+                replace(
+                    epic,
+                    name=st.text_input(
+                        "Epic name",
+                        value=epic.name,
+                        key="{}{}_name".format(_PLAN_WIDGET_PREFIX, epic.epic_id),
+                    ),
+                    goal=st.text_area(
+                        "Epic goal",
+                        value=epic.goal,
+                        key="{}{}_goal".format(_PLAN_WIDGET_PREFIX, epic.epic_id),
+                    ),
+                    priority=_plan_priority(
+                        epic.priority, "{}_priority".format(epic.epic_id)
+                    ),
+                )
+            )
+            for story in under:
+                st.markdown("---")
+                st.markdown("**{} — {}**".format(story.story_id, story.title))
+                stories.append(
+                    _render_plan_story_editor(story, component_choices, story_choices)
+                )
+                edited_story_ids.add(story.story_id)
+
+    orphans = tuple(story for story in plan.stories if story.story_id not in edited_story_ids)
+    if orphans:
+        st.markdown("**Stories under no epic**")
+        for story in orphans:
+            with st.expander("{} — {}".format(story.story_id, story.title), expanded=False):
+                stories.append(
+                    _render_plan_story_editor(story, component_choices, story_choices)
+                )
+
+    # Plan order, not editor order: the editor walks epics first and orphans last, and
+    # reordering the plan as a side effect of rendering it would change what is approved.
+    by_id = {story.story_id: story for story in stories}
+    ordered = [by_id.get(story.story_id, story) for story in plan.stories]
+    repaired, dropped = break_dependency_cycles(ordered)
+    if dropped:
+        st.warning(
+            "Those dependencies would make the work unstartable, so the closing link was "
+            "removed: {}.".format(", ".join(dropped))
+        )
+
+    edited = replace(plan, overview=overview, epics=tuple(epics), stories=tuple(repaired))
+    if edited != plan:
+        # Editing keeps the plan pending review. Only the approval button approves it.
+        return _persist_implementation_plan(edited)
+    return plan
+
+
+def _render_plan_readonly(plan: ImplementationPlan) -> None:
+    """The approved plan, shown rather than offered for editing."""
+    if plan.overview:
+        st.markdown(plan.overview)
+
+    def show_story(story) -> None:
+        st.markdown(
+            "- **{} {}** [{}] — delivers {}{}".format(
+                story.story_id,
+                story.title,
+                story.priority,
+                ", ".join(story.feature_ids) or "nothing traced",
+                " · after {}".format(", ".join(story.depends_on)) if story.depends_on else "",
+            )
+        )
+        if story.user_story:
+            st.markdown("    - _{}_".format(story.user_story))
+        for criterion in story.acceptance_criteria:
+            st.markdown("    - _Accepts_: {}".format(criterion))
+        for task in story.tasks:
+            st.markdown(
+                "    - _{}_ {} — {}{}".format(
+                    task.label,
+                    task.task_id,
+                    task.title,
+                    " ({})".format(", ".join(task.component_ids)) if task.component_ids else "",
+                )
+            )
+        for expectation in story.test_expectations:
+            st.markdown("    - _Tests_: {}".format(expectation))
+
+    for epic in plan.epics:
+        st.markdown(
+            "**{} {}** [{}] — {}".format(epic.epic_id, epic.name, epic.priority, epic.goal)
+        )
+        for story in plan.stories_for(epic.epic_id):
+            show_story(story)
+    orphans = plan.orphan_stories
+    if orphans:
+        st.markdown("**Stories under no epic**")
+        for story in orphans:
+            show_story(story)
+
+    order = plan.ordered_story_ids
+    if order:
+        st.caption("Dependency order: {}".format(" → ".join(order)))
+
+
+def _render_implementation_plan_stage(lifecycle) -> None:
+    """
+    The implementation plan stage: generate from the approved PRD and architecture, review,
+    edit, approve explicitly.
+
+    Blocked safely when either upstream artifact is missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent scope or invent
+    a system. Nothing here writes to Jira -- turning an approved plan into issues is the
+    delivery stage's job, and doing it here would create work nobody had reviewed.
+    """
+    prd = lifecycle.prd
+    architecture = lifecycle.architecture
+    if architecture is None or architecture.is_empty:
+        st.info(
+            "No architecture in this session yet. Open the Architecture stage and generate "
+            "one; the implementation plan is derived from the approved PRD and architecture."
+        )
+        return
+    if not (_architecture_approved() and _prd_approved() and _brd_approved()):
+        st.info(
+            "The architecture is pending review. Open the Architecture stage and approve "
+            "it to generate an implementation plan from it."
+        )
+        return
+
+    plan = _held_implementation_plan()
+
+    if st.button(
+        "Generate implementation plan from the approved PRD and architecture",
+        key="generate_implementation_plan",
+    ):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_PLAN_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY, None)
+        with st.spinner("Decomposing the approved design into epics, stories and tasks..."):
+            plan = _persist_implementation_plan(
+                generate_implementation_plan(prd, architecture, generate=_planner_generate())
+            )
+
+    if plan is None:
+        st.caption(
+            "Not generated yet. This decomposes the approved PRD and architecture into "
+            "epics, stories with acceptance criteria, and the technical tasks that build "
+            "them, with priorities and dependency order. It creates nothing in Jira and "
+            "nothing outside this session."
+        )
+        return
+
+    for note in plan.notes:
+        st.warning(note)
+
+    if plan.is_empty:
+        st.caption(
+            "No plan content could be derived. Nothing has been approved and nothing "
+            "downstream was generated."
+        )
+        return
+
+    _render_plan_traceability(plan, prd, architecture)
+
+    if bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.success("This implementation plan is approved.")
+        _render_plan_readonly(plan)
+        if st.button(
+            "Revoke implementation plan approval to edit", key="revoke_plan_approval"
+        ):
+            st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = False
+        return
+
+    plan = _render_plan_editor(plan, architecture)
+    st.caption(
+        "Approving records that you reviewed this plan. Nothing is created in Jira: the "
+        "delivery stage is what turns an approved plan into issues, and the sprint and "
+        "test stages after it are not implemented yet."
+    )
+    if st.button("Approve implementation plan", key="approve_implementation_plan"):
+        st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = True
+        _flash("success", "Implementation plan approved.")
 
 
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
@@ -2843,6 +3297,8 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
         _render_prd_stage(lifecycle)
     elif stage == ARCHITECTURE:
         _render_architecture_stage(lifecycle)
+    elif stage == IMPLEMENTATION_PLAN:
+        _render_implementation_plan_stage(lifecycle)
     elif stage == DELIVERY_STATUS:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "
@@ -2869,14 +3325,15 @@ def _render_lifecycle_workspace() -> None:
     st.subheader("Project delivery lifecycle")
     st.caption(
         "The delivery flow this project is being built towards. Discovery → BRD, "
-        "Product Definition → PRD, Architecture and the Jira delivery stage are "
-        "implemented; the stages between them are navigable and report that they are "
-        "not implemented yet."
+        "Product Definition → PRD, Architecture, Implementation Plan and the Jira "
+        "delivery stage are implemented; the stages between them are navigable and "
+        "report that they are not implemented yet."
     )
 
     brd_data = st.session_state.get(BRD_SESSION_KEY)
     prd_data = st.session_state.get(PRD_SESSION_KEY)
     architecture_data = st.session_state.get(ARCHITECTURE_SESSION_KEY)
+    plan_data = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
     lifecycle = lifecycle_from(
         brd=brd_data if isinstance(brd_data, BRDData) else None,
         discovery_source=str(st.session_state.get(BRD_SOURCE_SESSION_KEY) or ""),
@@ -2889,6 +3346,12 @@ def _render_lifecycle_workspace() -> None:
             architecture_data if isinstance(architecture_data, ArchitectureData) else None
         ),
         architecture_approved=bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY)),
+        implementation_plan=(
+            plan_data if isinstance(plan_data, ImplementationPlan) else None
+        ),
+        implementation_plan_approved=bool(
+            st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)
+        ),
     )
 
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):

@@ -14,7 +14,8 @@ nothing more.
 
 Nothing here duplicates an existing model. The BRD is the existing
 ``brd_models.BRDData``, the PRD the existing ``prd_models.PRDData``, the architecture the
-existing ``architecture_models.ArchitectureData``; the Jira work plan and creation
+existing ``architecture_models.ArchitectureData``, the implementation plan the existing
+``implementation_plan_models.ImplementationPlan``; the Jira work plan and creation
 results stay in ``jira_models`` and are read, not copied, when the delivery stage's
 status is derived.
 """
@@ -24,6 +25,7 @@ from typing import Optional
 
 from architecture_models import ArchitectureData
 from brd_models import BRDData
+from implementation_plan_models import ImplementationPlan
 from prd_models import PRDData
 
 # --- Stages ---------------------------------------------------------------
@@ -54,7 +56,13 @@ STAGE_LABEL = dict(STAGE_LABELS)
 # The stages that have a working implementation today. Everything else is navigable so
 # the shape of the product is visible, and is reported as not implemented rather than
 # given a control that would do nothing.
-IMPLEMENTED_STAGES = (DISCOVERY_BRD, PRD, ARCHITECTURE, DELIVERY_STATUS)
+IMPLEMENTED_STAGES = (
+    DISCOVERY_BRD,
+    PRD,
+    ARCHITECTURE,
+    IMPLEMENTATION_PLAN,
+    DELIVERY_STATUS,
+)
 
 # --- Stage state ----------------------------------------------------------
 
@@ -97,8 +105,9 @@ class ProjectLifecycle:
     ``brd`` is the artifact that exists today, held by reference. ``discovery_source``
     records which ingestion route produced it, because "where did this come from" is
     part of the artifact's provenance and the transcript itself is not kept. ``prd`` is
-    the product definition derived from an approved ``brd``, and ``architecture`` the
-    technical design derived from an approved ``prd``.
+    the product definition derived from an approved ``brd``, ``architecture`` the
+    technical design derived from an approved ``prd``, and ``implementation_plan`` the
+    engineering structure derived from both.
     """
 
     project_title: str = ""
@@ -106,6 +115,7 @@ class ProjectLifecycle:
     brd: Optional[BRDData] = None
     prd: Optional[PRDData] = None
     architecture: Optional[ArchitectureData] = None
+    implementation_plan: Optional[ImplementationPlan] = None
     stages: dict = field(default_factory=dict)
 
     def state(self, stage: str) -> StageState:
@@ -212,6 +222,57 @@ def _architecture_state(prd, prd_approved: bool, architecture, architecture_appr
     return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
 
 
+def _implementation_plan_state(
+    architecture, architecture_approved: bool, plan, plan_approved: bool
+):
+    """
+    The implementation plan stage's ``(status, detail)``.
+
+    The gate is the *approved* architecture, which in turn carries the approved PRD and
+    BRD behind it: work decomposed against a design nobody signed off would have to be
+    re-decomposed. As with every stage above, approval is only ever reported when the
+    approval control set it.
+    """
+    if architecture is None or getattr(architecture, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "Generate an architecture first. The implementation plan is derived from the "
+            "approved PRD and architecture.",
+        )
+    if not architecture_approved:
+        return (
+            NOT_STARTED,
+            "The architecture is still pending review. Approve it to generate an "
+            "implementation plan from it.",
+        )
+    if plan is None or getattr(plan, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "The approved architecture is ready. Generate an implementation plan of "
+            "epics, stories and technical tasks from it.",
+        )
+
+    coverage = (
+        "{} epic(s), {} story/stories and {} task(s) covering {} of {} PRD feature(s)"
+    ).format(
+        len(getattr(plan, "epics", ()) or ()),
+        len(getattr(plan, "stories", ()) or ()),
+        getattr(plan, "task_count", 0),
+        len(getattr(plan, "covered_feature_ids", ()) or ()),
+        len(getattr(plan, "source_feature_ids", ()) or ()),
+    )
+    if plan_approved:
+        return (APPROVED, coverage + ". Approved as the basis for delivery.")
+    if getattr(plan, "is_baseline", False):
+        return (
+            DRAFT,
+            coverage + ". This is the deterministic fallback -- one epic and story per "
+            "feature, with no sequencing or estimates. Edit it, or generate again with "
+            "the AI planner available.",
+        )
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
+
+
 def lifecycle_from(
     brd: Optional[BRDData] = None,
     discovery_source: str = "",
@@ -222,18 +283,23 @@ def lifecycle_from(
     prd_approved: bool = False,
     architecture: Optional[ArchitectureData] = None,
     architecture_approved: bool = False,
+    implementation_plan: Optional[ImplementationPlan] = None,
+    implementation_plan_approved: bool = False,
 ) -> ProjectLifecycle:
     """
     Derive the current lifecycle from the artifacts this session actually holds.
 
     Read-only: every status comes from something that exists, so no stage can report
     progress that was not made. A generated artifact reaches ``Pending Review`` and
-    stops there; ``brd_approved``, ``prd_approved`` and ``architecture_approved`` are set
-    only by the explicit approval controls, because moving an artifact to ``Approved`` on
-    its own is the silent state change the product direction forbids.
+    stops there; ``brd_approved``, ``prd_approved``, ``architecture_approved`` and
+    ``implementation_plan_approved`` are set only by the explicit approval controls,
+    because moving an artifact to ``Approved`` on its own is the silent state change the
+    product direction forbids.
 
     ``plan`` is a ``JiraWorkPlan`` and ``created`` the ``CreatedIssue`` results of a
-    creation run, both read positionally so this module stays independent of Jira.
+    creation run, both read positionally so this module stays independent of Jira. The
+    lifecycle's own ``implementation_plan`` is a different artifact entirely: it is the
+    engineering structure the delivery stage later turns into issues.
     """
     lifecycle = ProjectLifecycle(
         project_title=(brd.project_title if brd is not None else ""),
@@ -241,6 +307,7 @@ def lifecycle_from(
         brd=brd,
         prd=prd,
         architecture=architecture,
+        implementation_plan=implementation_plan,
     )
 
     if brd is None:
@@ -269,13 +336,24 @@ def lifecycle_from(
     lifecycle.record(PRD, *_prd_state(brd, brd_approved, prd, prd_approved))
     # Revoking the BRD's approval unapproves everything derived from it: the PRD stage
     # returns to Not Started, so the architecture behind it cannot still read as ready.
+    architecture_ready = prd_approved and brd_approved
     lifecycle.record(
         ARCHITECTURE,
-        *_architecture_state(
-            prd, prd_approved and brd_approved, architecture, architecture_approved
+        *_architecture_state(prd, architecture_ready, architecture, architecture_approved)
+    )
+    # The same cascade one stage further down: the plan's gate is an approved architecture
+    # whose own upstream approvals still hold, so revoking any of them returns this stage
+    # to Not Started rather than leaving work planned against an unapproved design.
+    lifecycle.record(
+        IMPLEMENTATION_PLAN,
+        *_implementation_plan_state(
+            architecture,
+            architecture_approved and architecture_ready,
+            implementation_plan,
+            implementation_plan_approved,
         )
     )
-    for stage in (IMPLEMENTATION_PLAN, SPRINT_PLAN, TEST_CASES, TEST_EXECUTION):
+    for stage in (SPRINT_PLAN, TEST_CASES, TEST_EXECUTION):
         lifecycle.record(stage, NOT_STARTED, NOT_IMPLEMENTED_DETAIL)
 
     succeeded = tuple(

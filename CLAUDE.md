@@ -4,13 +4,34 @@
 
 This project is evolving from a BRD/Jira automation tool into an **AI-assisted software delivery lifecycle platform**.
 
-The goal is to take an e-commerce product idea from stakeholder discovery through:
+The goal is to take a software product idea from stakeholder discovery through:
 
 Discovery → BRD → PRD → Architecture → Jira Implementation Plan → Sprint Planning → Test Cases → Test Execution / Delivery Tracking.
+
+The platform is **domain-agnostic**. The domain arrives entirely through the uploaded transcript and the artifacts derived from it, so the same engine must handle e-commerce, social, streaming, fintech, SaaS and enterprise products without domain-specific code. E-commerce is the primary demonstration domain, not a hard-coded limitation: no module should branch on the domain.
 
 The system should help a System Analyst / Business Analyst / Product Manager progressively transform business discussions into structured software-delivery artifacts.
 
 The system must remain human-in-the-loop. AI should propose artifacts and plans; users should review and explicitly approve important outputs before downstream stages are committed.
+
+### Implementation status
+
+This document is the **target specification**. Stages it describes with "should" are requirements, not claims about what exists. What is built today:
+
+| Stage | Status |
+| ----- | ------ |
+| Discovery → BRD | Implemented (four ingestion sources, evidence validation, Markdown export, explicit approval) |
+| BRD → PRD | Implemented (`prd_generator.py`, review/edit, explicit approval) |
+| PRD → Architecture | Implemented (`architecture_generator.py`, review/edit, explicit approval) |
+| Architecture → Implementation Plan | Implemented (`implementation_plan_generator.py`, epic/story/task hierarchy, review/edit, explicit approval; writes nothing to Jira) |
+| Implementation Plan → Jira | **Not implemented.** The existing Jira layer maps the *BRD* onto issues; mapping an approved plan is the next stage of work. |
+| Sprint Planning | **Not implemented.** |
+| Story → Test Cases | **Not implemented.** |
+| Test Execution / Delivery Tracking | Partially implemented: Jira creation results and execution status are read and displayed; test-case execution recording is not built. |
+| AI Coding Agent | **Not implemented.** |
+| Sprint Completion / Next Sprint | **Not implemented.** |
+
+Keep this table accurate. A stage is "Implemented" only when it has a generator, a human approval gate and tests.
 
 ---
 
