@@ -7,20 +7,22 @@ The product is moving from "generate one BRD" to a staged delivery lifecycle:
     -> Test Cases -> Test Execution -> Jira / Delivery Status
 
 This module holds only the state of that progression. It deliberately does *not*
-define a PRD, an architecture or a test case: those generators do not exist yet, and a
+define an architecture or a test case: those generators do not exist yet, and a
 placeholder shape for an artifact nobody can produce would be a guess that the real
 implementation would have to undo. Until a stage has a generator it carries a
 ``StageState`` and nothing more.
 
 Nothing here duplicates an existing model. The BRD is the existing
-``brd_models.BRDData``; the Jira work plan and creation results stay in
-``jira_models`` and are read, not copied, when the delivery stage's status is derived.
+``brd_models.BRDData``, the PRD the existing ``prd_models.PRDData``; the Jira work plan
+and creation results stay in ``jira_models`` and are read, not copied, when the
+delivery stage's status is derived.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 
 from brd_models import BRDData
+from prd_models import PRDData
 
 # --- Stages ---------------------------------------------------------------
 
@@ -50,7 +52,7 @@ STAGE_LABEL = dict(STAGE_LABELS)
 # The stages that have a working implementation today. Everything else is navigable so
 # the shape of the product is visible, and is reported as not implemented rather than
 # given a control that would do nothing.
-IMPLEMENTED_STAGES = (DISCOVERY_BRD, DELIVERY_STATUS)
+IMPLEMENTED_STAGES = (DISCOVERY_BRD, PRD, DELIVERY_STATUS)
 
 # --- Stage state ----------------------------------------------------------
 
@@ -92,12 +94,14 @@ class ProjectLifecycle:
 
     ``brd`` is the artifact that exists today, held by reference. ``discovery_source``
     records which ingestion route produced it, because "where did this come from" is
-    part of the artifact's provenance and the transcript itself is not kept.
+    part of the artifact's provenance and the transcript itself is not kept. ``prd`` is
+    the product definition derived from an approved ``brd``.
     """
 
     project_title: str = ""
     discovery_source: str = ""
     brd: Optional[BRDData] = None
+    prd: Optional[PRDData] = None
     stages: dict = field(default_factory=dict)
 
     def state(self, stage: str) -> StageState:
@@ -119,18 +123,64 @@ class ProjectLifecycle:
         return any(state.status != NOT_STARTED for state in self.stages.values())
 
 
+def _prd_state(brd, brd_approved: bool, prd, prd_approved: bool):
+    """
+    The PRD stage's ``(status, detail)``.
+
+    The gate is the *approved* BRD, not merely a generated one: the PRD stage says what
+    the product does about requirements the business has signed off. Approval is only
+    ever reported when the approval control set it.
+    """
+    if brd is None:
+        return (
+            NOT_STARTED,
+            "Generate a BRD first. The PRD is derived from the approved BRD.",
+        )
+    if not brd_approved:
+        return (
+            NOT_STARTED,
+            "The BRD is still pending review. Approve it to generate a PRD from it.",
+        )
+    if prd is None or getattr(prd, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "The approved BRD is ready. Generate a PRD from it, optionally with a "
+            "product-refinement transcript.",
+        )
+
+    covered = len(getattr(prd, "covered_requirement_ids", ()) or ())
+    total = len(getattr(prd, "source_requirement_ids", ()) or ())
+    coverage = "{} feature(s) covering {} of {} BRD requirement(s)".format(
+        len(getattr(prd, "features", ()) or ()), covered, total
+    )
+    if prd_approved:
+        return (APPROVED, coverage + ". Approved.")
+    if getattr(prd, "is_baseline", False):
+        return (
+            DRAFT,
+            coverage + ". This is the deterministic fallback -- one feature per "
+            "requirement, with no journeys or edge cases. Edit it, or generate again "
+            "with the AI generator available.",
+        )
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
+
+
 def lifecycle_from(
     brd: Optional[BRDData] = None,
     discovery_source: str = "",
     plan=None,
     created=(),
+    brd_approved: bool = False,
+    prd: Optional[PRDData] = None,
+    prd_approved: bool = False,
 ) -> ProjectLifecycle:
     """
     Derive the current lifecycle from the artifacts this session actually holds.
 
     Read-only: every status comes from something that exists, so no stage can report
-    progress that was not made. A BRD reaches ``Pending Review`` and not ``Approved``
-    because this app has no BRD approval control yet -- claiming approval would be the
+    progress that was not made. A generated artifact reaches ``Pending Review`` and
+    stops there; ``brd_approved`` and ``prd_approved`` are set only by the explicit
+    approval controls, because moving an artifact to ``Approved`` on its own is the
     silent state change the product direction forbids.
 
     ``plan`` is a ``JiraWorkPlan`` and ``created`` the ``CreatedIssue`` results of a
@@ -140,6 +190,7 @@ def lifecycle_from(
         project_title=(brd.project_title if brd is not None else ""),
         discovery_source=str(discovery_source or ""),
         brd=brd,
+        prd=prd,
     )
 
     if brd is None:
@@ -149,23 +200,23 @@ def lifecycle_from(
             "No transcript has been converted into a BRD in this session yet.",
         )
     else:
-        lifecycle.record(
-            DISCOVERY_BRD,
-            PENDING_REVIEW,
-            "{} functional and {} non-functional requirement(s) generated{}. "
-            "Review and export it above.".format(
-                len(brd.functional_requirements),
-                len(brd.non_functional_requirements),
-                " from {}".format(discovery_source) if discovery_source else "",
-            ),
+        counts = "{} functional and {} non-functional requirement(s) generated{}.".format(
+            len(brd.functional_requirements),
+            len(brd.non_functional_requirements),
+            " from {}".format(discovery_source) if discovery_source else "",
         )
+        if brd_approved:
+            lifecycle.record(
+                DISCOVERY_BRD,
+                APPROVED,
+                counts + " Approved as the basis for the PRD.",
+            )
+        else:
+            lifecycle.record(
+                DISCOVERY_BRD, PENDING_REVIEW, counts + " Review and approve it below."
+            )
 
-    lifecycle.record(
-        PRD,
-        NOT_STARTED,
-        "Will be generated from the approved BRD, with an optional product-refinement "
-        "transcript. " + NOT_IMPLEMENTED_DETAIL,
-    )
+    lifecycle.record(PRD, *_prd_state(brd, brd_approved, prd, prd_approved))
     for stage in (ARCHITECTURE, IMPLEMENTATION_PLAN, SPRINT_PLAN, TEST_CASES, TEST_EXECUTION):
         lifecycle.record(stage, NOT_STARTED, NOT_IMPLEMENTED_DETAIL)
 

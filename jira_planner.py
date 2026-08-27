@@ -40,12 +40,21 @@ of its own, no credential of its own, and no import of ``main`` -- which is also
 keeps it testable without a live model.
 """
 
-import json
 import re
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from brd_models import BRDData
+from model_output import (
+    ModelResponseError,
+    block as _block,
+    excerpt as _excerpt,
+    first as _first,
+    json_payload,
+    line as _line,
+    normalise_id as _normalise_id,
+    strings as _strings,
+)
 from jira_models import (
     JiraProject,
     JiraProjectMetadata,
@@ -110,68 +119,12 @@ class PlannerResponseError(Exception):
     """
 
 
-def _line(value) -> str:
-    """One line of text: whitespace collapsed, ``None`` becoming ``""``."""
-    return " ".join(str(value if value is not None else "").split())
-
-
-def _block(value) -> str:
-    """Multi-line text with its own line breaks kept and trailing space removed."""
-    text = str(value if value is not None else "").replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(line.rstrip() for line in text.split("\n")).strip()
-
-
-def _excerpt(value, limit: int = MAX_EXCERPT_LENGTH) -> str:
-    """One line, truncated with an ellipsis rather than cut mid-word-ish."""
-    text = _line(value)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
-def _strings(value) -> list:
-    """
-    A list of non-empty single-line strings from whatever the model sent.
-
-    Accepts a list, a bare string, or a list of small objects such as
-    ``[{"id": "FR-1"}]``, because all three turn up in practice. Anything else
-    contributes nothing rather than raising: a malformed member of one field is not a
-    reason to discard an otherwise usable item.
-    """
-    if value is None:
-        return []
-    if isinstance(value, (str, bytes)):
-        single = _line(value)
-        return [single] if single else []
-    if isinstance(value, dict):
-        value = list(value.values())
-    if not isinstance(value, (list, tuple, set)):
-        single = _line(value)
-        return [single] if single else []
-
-    out: list = []
-    for item in value:
-        if isinstance(item, dict):
-            cleaned = ""
-            for key in ("id", "requirement_id", "action_item_id", "key", "value", "item"):
-                if item.get(key):
-                    cleaned = _line(item.get(key))
-                    break
-        else:
-            cleaned = _line(item)
-        if cleaned:
-            out.append(cleaned)
-    return out
-
-
-def _first(payload: dict, *names):
-    """The first of ``names`` present in ``payload`` with a non-empty value."""
-    for name in names:
-        if name in payload:
-            value = payload.get(name)
-            if value not in (None, "", [], (), {}):
-                return value
-    return None
+def _json_payload(raw):
+    """The response as Python data, with the shared reader's error re-raised as ours."""
+    try:
+        return json_payload(raw, "AI planner")
+    except ModelResponseError as error:
+        raise PlannerResponseError(str(error)) from error
 
 
 def action_item_index(brd_data: BRDData) -> dict:
@@ -403,82 +356,6 @@ def _maybe_int(value) -> Optional[int]:
     return None
 
 
-def _first_json_span(text: str) -> Optional[str]:
-    """
-    The first balanced ``{...}`` or ``[...]`` in ``text``, or ``None``.
-
-    String literals are tracked so a brace inside a description cannot end the span
-    early. This exists because a model told to return JSON only will still occasionally
-    prefix a sentence, and re-prompting to fix that would be a second model call.
-    """
-    start = None
-    for index, character in enumerate(text):
-        if character in "{[":
-            start = index
-            break
-    if start is None:
-        return None
-
-    opener = text[start]
-    closer = "}" if opener == "{" else "]"
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        character = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character == opener:
-            depth += 1
-        elif character == closer:
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    return None
-
-
-def _json_payload(raw):
-    """
-    The model's response as Python data.
-
-    Raises ``PlannerResponseError`` rather than returning something half-read, so the
-    caller's one decision -- use this plan or fall back to the deterministic one --
-    stays a single branch.
-    """
-    if isinstance(raw, (dict, list)):
-        return raw
-
-    text = str(raw or "").strip()
-    if not text:
-        raise PlannerResponseError("The AI planner returned an empty response.")
-
-    unfenced = re.sub(r"^```[A-Za-z]*\s*", "", text)
-    unfenced = re.sub(r"\s*```\s*$", "", unfenced).strip()
-
-    for candidate in (unfenced, text):
-        try:
-            return json.loads(candidate)
-        except (TypeError, ValueError):
-            pass
-
-    span = _first_json_span(unfenced)
-    if span is not None:
-        try:
-            return json.loads(span)
-        except ValueError:
-            pass
-
-    raise PlannerResponseError("The AI planner's response could not be read as JSON.")
-
-
 def _item_rows(payload) -> list:
     """The list of proposed items inside a parsed response, in the order given."""
     if isinstance(payload, list):
@@ -607,11 +484,6 @@ def _unique(existing: set, candidate: str, position: int) -> str:
             key = "{} ({})".format(candidate, suffix)
     existing.add(key)
     return key
-
-
-def _normalise_id(value: str) -> str:
-    """An id in comparison form: trimmed of stray punctuation, case-folded."""
-    return _line(value).strip(" .,;:()[]").lower()
 
 
 def _requirement_lookup(requirements: list, keys: list) -> dict:

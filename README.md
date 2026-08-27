@@ -4,7 +4,7 @@ This project is a Streamlit web application for an AI-assisted software delivery
 
 > **Discovery → BRD → PRD → Architecture → Implementation Plan → Sprint Planning → Test Cases → Test Execution → Jira / Delivery Status**
 
-Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD) and optionally delivers the reviewed requirements into Jira as traceable issues. The stages between the BRD and Jira delivery — PRD, architecture, implementation plan, sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [Project Delivery Lifecycle](#project-delivery-lifecycle) for exactly what is built and what is planned.
+Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), derives a Product Requirements Document (PRD) from an approved BRD, and optionally delivers the reviewed requirements into Jira as traceable issues. The stages between the PRD and Jira delivery — architecture, implementation plan, sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [BRD to PRD](#brd-to-prd) and [What Has Actually Been Verified](#what-has-actually-been-verified) for exactly what is built and what is planned.
 
 It is designed as a portfolio piece to demonstrate skills in business analysis, requirements engineering, and the responsible application of Large Language Models (LLMs).
 
@@ -48,6 +48,9 @@ All four ingestion sources normalize into one `NormalizedTranscript` and then fl
                                 ▼
               BRD Display in UI & Markdown Export
                                 ▼
+        Explicit BRD approval → PRD generation  (+ optional
+        product-refinement transcript) → review/edit → approval
+                                ▼
         Optional Jira delivery  (OAuth 2.0 3LO + Atlassian REST)
         site → project → required fields → work plan → review
                  → explicit confirmation → issue creation
@@ -62,6 +65,9 @@ Everything after the Markdown export is optional. A BRD is complete without it, 
 | `main.py`                     | Streamlit UI, OAuth callback handling, Gemini call, evidence validation, Markdown export, Jira panel, lifecycle workspace |
 | `lifecycle_models.py`         | Delivery lifecycle stages, states, and `lifecycle_from` derivation from session artifacts                                 |
 | `brd_models.py`               | `NormalizedTranscript` and the BRD dataclasses                                                                            |
+| `prd_models.py`               | PRD dataclasses: `Feature`, `Persona`, `UserJourney`, `PRDData`, and BRD-requirement traceability                          |
+| `prd_generator.py`            | Approved BRD → PRD prompt, untrusted-response validation, deterministic baseline fallback                                  |
+| `model_output.py`             | Shared reader for untrusted model output: JSON extraction, field aliases, safe error messages                              |
 | `transcript_processor.py`     | Manual-paste and `.txt` upload normalization                                                                              |
 | `providers/base.py`           | `TranscriptProvider` contract and the provider error hierarchy                                                            |
 | `providers/oauth_state.py`    | Signed CSRF state + PKCE handshake values                                                                                 |
@@ -163,6 +169,16 @@ The "Python Evidence Validation Layer" is the key to the application's reliabili
 
 This check is identical for all four sources. A transcript retrieved from Google Meet or Teams gets no special treatment, which is why provider transcript text is preserved verbatim rather than reformatted.
 
+## BRD to PRD
+
+An **approved** BRD can be turned into a Product Requirements Document from the "Product Definition → PRD" stage in the project workspace. The PRD is a different document, not a restatement: it adds a product overview, goals, personas, features, user journeys, functional behaviour, edge cases, acceptance criteria, product assumptions, open questions and — only where the material supports them — success metrics.
+
+- **The approved BRD is the input.** No second transcript is required. A product-refinement discussion can optionally be pasted in (or reused from a transcript already loaded in the session) to enrich the result, and the source it came from is recorded on the PRD.
+- **Approval gates the stage.** The stage offers no generation control until the BRD has been approved through its own button, and generating a PRD leaves it at *Pending Review*. Editing it keeps it there. Only the "Approve PRD" button moves it to *Approved*.
+- **Traceability is structural.** Every feature and journey names the BRD requirement ids it serves, reusing the ids already in the BRD. Requirement ids the BRD does not hold are removed, a feature that names none is dropped, and uncovered BRD requirements are reported in the PRD's notes rather than hidden.
+- **Failure degrades instead of inventing.** With no model configured, an unreachable provider, or a response that cannot be read, the stage falls back to a deterministic one-feature-per-requirement draft and says why in a note. Provider failures report the exception type only, never the client's message.
+- **A new BRD invalidates what came from the old one.** Regenerating or re-storing a BRD clears its approval, the PRD, the PRD's approval and the review editor's state.
+
 ## Optional Jira Delivery
 
 A reviewed BRD can be turned into Jira issues without leaving the app. The panel appears under the BRD and takes five explicit steps: choose a Jira site, choose a project, check what that project's issue types actually require, generate a work plan, and create the selected issues.
@@ -227,7 +243,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 ./brd-env/bin/pytest -q
 ```
 
-**Last run: 497 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
+**Last run: 528 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
 
 | File                            | Covers                                                                                                                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -246,6 +262,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | `test_jira_work_plan_review.py` | Plan editing, per-issue selection, review-state invalidation when the plan or target changes                                                                                                                                                      |
 | `test_jira_creation.py`         | Confirmation gating, parents-before-children ordering, partial-failure reporting, `CreatedIssue` mapping, no request on a rerun                                                                                                                   |
 | `test_lifecycle_workspace.py`   | Lifecycle stage ordering, state vocabulary enforcement, derived status from session artifacts, workspace rendering, JIRA-010 removal assertions                                                                                                   |
+| `test_prd.py`                   | Approved BRD → PRD generation, the approval gate, optional refinement transcript, BRD → PRD traceability, review/edit persistence, explicit approval, provider and malformed-response fallbacks                                                    |
 
 ## What Has Actually Been Verified
 
@@ -258,6 +275,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | OAuth state, PKCE, token refresh and retry logic                      | Covered by tests                                                                                                                                                                   |
 | Jira work-plan generation, validation, review and confirmation gating | Covered by tests; no network involved in building or reviewing a plan                                                                                                              |
 | Lifecycle workspace: all 8 stages, derived status, no JIRA-010 drift  | Covered by `test_lifecycle_workspace.py`                                                                                                                                           |
+| Approved BRD → PRD, traceability, review/edit and explicit approval   | Covered by `test_prd.py`; the model is injected as a callable, so no PRD test reaches a provider                                                                                    |
 | **Live Google Meet transcript retrieval**                             | **Not verified.** Requires real `GOOGLE_WORKSPACE_*` credentials and a Google Workspace account with Meet transcription enabled.                                                   |
 | **Live Microsoft Teams transcript retrieval**                         | **Not verified.** Requires a real Entra ID app registration, `AZURE_*` credentials, and tenant admin consent.                                                                      |
 | **Live Jira issue creation**                                          | **Not verified in this repository.** All Jira tests run against mocked Atlassian responses; a real end-to-end run needs a Jira Cloud site and an app with the five scopes granted. |
@@ -272,5 +290,6 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 - **Verbatim evidence check.** Validation uses exact substring containment, so a paraphrased quote is demoted to an Assumption even when the underlying point is real.
 - **Stateless operation.** Nothing is persisted between sessions; tokens vanish when the session ends and BRD drafts are downloaded as Markdown.
 - **A stale plan is tolerated, not corrected.** After a BRD is regenerated, a previously generated work plan still restates the older wording until it is regenerated.
+- **The PRD stops at approval.** Nothing consumes an approved PRD yet — architecture, implementation plan, sprint planning, test cases and test execution are not implemented — and the PRD has no Markdown export of its own, so it lives only in the session.
 - **OAuth state does not survive a restart** unless `OAUTH_STATE_SECRET` is set, because the signing key is otherwise generated per process. An in-flight sign-in must be restarted.
 - **Prompt sensitivity.** Output quality is bounded by the clarity and completeness of the source notes.

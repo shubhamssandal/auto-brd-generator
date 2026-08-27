@@ -1,5 +1,6 @@
 import os
 import json
+from dataclasses import replace
 from typing import Optional
 
 import streamlit as st
@@ -23,14 +24,18 @@ from transcript_processor import (
 )
 from jira_models import CreatedIssue
 from lifecycle_models import (
+    APPROVED,
     DELIVERY_STATUS,
     DISCOVERY_BRD,
     IMPLEMENTED_STAGES,
     LIFECYCLE_STAGES,
+    PRD,
     STAGE_LABEL,
     lifecycle_from,
 )
 from jira_planner import action_item_index, generate_work_plan
+from prd_generator import generate_prd
+from prd_models import PRDData
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -637,6 +642,41 @@ BRD_SESSION_KEY = "brd_data"
 # is all the provenance the Discovery stage can report.
 BRD_SOURCE_SESSION_KEY = "brd_source"
 
+# Whether the reviewer explicitly approved that BRD. The PRD stage is gated on it:
+# a generated BRD is a draft until a person says otherwise, and nothing sets this
+# except the approval button.
+BRD_APPROVED_SESSION_KEY = "brd_approved"
+
+# The PRD derived from the approved BRD, whether the reviewer approved it, and the
+# optional product-refinement transcript that enriched it.
+PRD_SESSION_KEY = "prd_data"
+PRD_APPROVED_SESSION_KEY = "prd_approved"
+PRD_REFINEMENT_SESSION_KEY = "prd_refinement"
+
+# Streamlit widget keys for the PRD review editors, kept under one prefix so a new PRD
+# cannot inherit the previous one's editor values.
+_PRD_WIDGET_PREFIX = "prd_review__"
+
+
+def _clear_prd_widgets() -> None:
+    """Drop PRD review-editor widget state."""
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_PRD_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_prd_state() -> None:
+    """
+    Forget the PRD, its approval and its editors.
+
+    Called when the BRD changes: a PRD is a product definition of one specific BRD, so
+    a new BRD makes a held PRD wrong rather than merely old, and its approval cannot
+    carry over to a document nobody has reviewed.
+    """
+    for key in (PRD_SESSION_KEY, PRD_APPROVED_SESSION_KEY, PRD_REFINEMENT_SESSION_KEY):
+        st.session_state.pop(key, None)
+    _clear_prd_widgets()
+
 # Streamlit widget keys for the work-plan review editors. Not under ``jira__``:
 # those suffixes are plan data, and a leftover text-input value would otherwise
 # outlive the plan it described.
@@ -688,10 +728,13 @@ def _store_brd(brd_data: BRDData, source: str = "") -> None:
 
     A plan built from the previous BRD is dropped rather than left behind. A work
     plan is a proposal about one specific BRD, so a newly generated BRD makes a
-    cached plan wrong, not merely old.
+    cached plan wrong, not merely old. The same applies to a PRD and to any approval
+    recorded against the BRD that has just been replaced.
     """
     st.session_state[BRD_SESSION_KEY] = brd_data
     st.session_state[BRD_SOURCE_SESSION_KEY] = str(source or "")
+    st.session_state.pop(BRD_APPROVED_SESSION_KEY, None)
+    _clear_prd_state()
     for suffix in (
         "plan",
         "plan_for",
@@ -2014,6 +2057,357 @@ def _render_jira_section() -> None:
 # --- Project lifecycle workspace ---
 
 
+def _brd_approved() -> bool:
+    """Whether the reviewer approved the BRD held in this session."""
+    return bool(st.session_state.get(BRD_APPROVED_SESSION_KEY))
+
+
+def _held_prd():
+    """The PRD this session holds, or ``None``."""
+    prd = st.session_state.get(PRD_SESSION_KEY)
+    return prd if isinstance(prd, PRDData) else None
+
+
+def _persist_prd(prd: PRDData) -> PRDData:
+    st.session_state[PRD_SESSION_KEY] = prd
+    return prd
+
+
+def _render_brd_approval() -> None:
+    """
+    The explicit BRD approval control, which is what unlocks the PRD stage.
+
+    Nothing else sets or clears this: generating a BRD leaves it pending, and
+    approving is a deliberate act recorded against the BRD in front of the reviewer.
+    """
+    if _brd_approved():
+        st.success("This BRD is approved and is the basis for the PRD.")
+        if st.button("Revoke BRD approval", key="revoke_brd_approval"):
+            st.session_state[BRD_APPROVED_SESSION_KEY] = False
+            _flash(
+                "info",
+                "BRD approval was revoked. The PRD already generated from it is kept, "
+                "but the BRD is pending review again.",
+            )
+        return
+
+    st.caption(
+        "Approving records that you reviewed the requirements above. It creates nothing "
+        "and changes no requirement; it unlocks PRD generation from this BRD."
+    )
+    if st.button("Approve BRD", key="approve_brd"):
+        st.session_state[BRD_APPROVED_SESSION_KEY] = True
+        _flash("success", "BRD approved. The PRD can now be generated from it.")
+
+
+def _prd_refinement() -> Optional[NormalizedTranscript]:
+    """
+    The optional product-refinement discussion, if the reviewer supplied one.
+
+    Optional by design: the PRD is derived from the approved BRD, and this only enriches
+    it. A transcript already loaded from a provider in this session can be reused rather
+    than pasted again; anything pasted here becomes the same ``NormalizedTranscript``
+    every other ingestion route produces.
+    """
+    loaded = [
+        value
+        for key, value in st.session_state.items()
+        if str(key).endswith("__transcript") and isinstance(value, NormalizedTranscript)
+    ]
+
+    with st.expander("Optional product-refinement discussion"):
+        st.caption(
+            "Not required. The PRD is generated from the approved BRD; a product "
+            "discussion only adds product detail on top of it."
+        )
+        if loaded:
+            transcript = loaded[0]
+            if st.checkbox(
+                "Use the {} transcript already loaded in this session".format(
+                    transcript.source or "loaded"
+                ),
+                key=_PRD_WIDGET_PREFIX + "use_loaded",
+            ):
+                st.session_state[PRD_REFINEMENT_SESSION_KEY] = transcript
+                return transcript
+
+        pasted = st.text_area(
+            "Paste a product-refinement discussion (optional)",
+            value="",
+            key=_PRD_WIDGET_PREFIX + "refinement_text",
+            height=140,
+        )
+        text = str(pasted or "").strip()
+        if not text:
+            st.session_state.pop(PRD_REFINEMENT_SESSION_KEY, None)
+            return None
+        transcript = NormalizedTranscript(raw_text=text, source="manual")
+        st.session_state[PRD_REFINEMENT_SESSION_KEY] = transcript
+        return transcript
+
+
+def _render_prd_traceability(prd: PRDData) -> None:
+    """Which BRD requirements this PRD covers, and which it does not."""
+    covered = prd.covered_requirement_ids
+    st.caption(
+        "Traceability: {} of {} BRD requirement(s) covered — {}".format(
+            len(covered),
+            len(prd.source_requirement_ids),
+            ", ".join(covered) if covered else "none",
+        )
+    )
+    if prd.uncovered_requirement_ids:
+        st.warning(
+            "Not covered by any feature or journey: {}. Either that is deliberate — "
+            "record it as an open question — or the PRD is incomplete.".format(
+                ", ".join(prd.uncovered_requirement_ids)
+            )
+        )
+
+
+def _prd_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(
+            label,
+            value=_criteria_text(values),
+            key=_PRD_WIDGET_PREFIX + suffix,
+        )
+    )
+
+
+def _render_prd_editor(prd: PRDData) -> PRDData:
+    """
+    The review and edit surface: every edit is kept, and none of them approves anything.
+
+    Requirement ids are shown but not editable. Traceability is derived from the BRD,
+    so letting it be typed over would let a reviewer claim coverage the BRD does not
+    support.
+    """
+    overview = st.text_area(
+        "Product overview",
+        value=prd.overview,
+        key=_PRD_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    goals = _prd_lines("Product goals (one per line)", prd.goals, "goals")
+    metrics = _prd_lines(
+        "Success metrics (one per line)", prd.success_metrics, "success_metrics"
+    )
+    assumptions = _prd_lines(
+        "Product assumptions (one per line)", prd.assumptions, "assumptions"
+    )
+    questions = _prd_lines(
+        "Open questions (one per line)", prd.open_questions, "open_questions"
+    )
+
+    personas = []
+    for position, persona in enumerate(prd.personas, start=1):
+        with st.expander("Persona — {}".format(persona.name)):
+            personas.append(
+                replace(
+                    persona,
+                    description=st.text_area(
+                        "Description",
+                        value=persona.description,
+                        key="{}persona_{}_description".format(_PRD_WIDGET_PREFIX, position),
+                    ),
+                    needs=_prd_lines(
+                        "Needs (one per line)", persona.needs, "persona_{}_needs".format(position)
+                    ),
+                )
+            )
+
+    features = []
+    for feature in prd.features:
+        with st.expander(
+            "{} — {} ({})".format(
+                feature.feature_id, feature.name, ", ".join(feature.requirement_ids)
+            )
+        ):
+            st.caption(
+                "Serves BRD requirement(s): {}".format(", ".join(feature.requirement_ids))
+            )
+            features.append(
+                replace(
+                    feature,
+                    name=st.text_input(
+                        "Feature name",
+                        value=feature.name,
+                        key="{}{}_name".format(_PRD_WIDGET_PREFIX, feature.feature_id),
+                    ),
+                    summary=st.text_area(
+                        "Summary",
+                        value=feature.summary,
+                        key="{}{}_summary".format(_PRD_WIDGET_PREFIX, feature.feature_id),
+                    ),
+                    behaviours=_prd_lines(
+                        "Functional behaviour (one per line)",
+                        feature.behaviours,
+                        "{}_behaviours".format(feature.feature_id),
+                    ),
+                    edge_cases=_prd_lines(
+                        "Edge cases (one per line)",
+                        feature.edge_cases,
+                        "{}_edge_cases".format(feature.feature_id),
+                    ),
+                    acceptance_criteria=_prd_lines(
+                        "Acceptance criteria (one per line)",
+                        feature.acceptance_criteria,
+                        "{}_criteria".format(feature.feature_id),
+                    ),
+                )
+            )
+
+    journeys = []
+    for position, journey in enumerate(prd.journeys, start=1):
+        with st.expander(
+            "Journey — {}{}".format(
+                journey.name, " ({})".format(journey.persona) if journey.persona else ""
+            )
+        ):
+            if journey.requirement_ids:
+                st.caption(
+                    "Serves BRD requirement(s): {}".format(", ".join(journey.requirement_ids))
+                )
+            journeys.append(
+                replace(
+                    journey,
+                    steps=_prd_lines(
+                        "Steps, in order (one per line)",
+                        journey.steps,
+                        "journey_{}_steps".format(position),
+                    ),
+                )
+            )
+
+    edited = replace(
+        prd,
+        overview=overview,
+        goals=goals,
+        success_metrics=metrics,
+        assumptions=assumptions,
+        open_questions=questions,
+        personas=tuple(personas),
+        features=tuple(features),
+        journeys=tuple(journeys),
+    )
+    if edited != prd:
+        # Editing keeps the PRD pending review. Only the approval button approves it.
+        return _persist_prd(edited)
+    return prd
+
+
+def _render_prd_readonly(prd: PRDData) -> None:
+    """The approved PRD, shown rather than offered for editing."""
+    if prd.overview:
+        st.markdown(prd.overview)
+    for heading, values in (
+        ("Goals", prd.goals),
+        ("Success metrics", prd.success_metrics),
+        ("Assumptions", prd.assumptions),
+        ("Open questions", prd.open_questions),
+    ):
+        if values:
+            st.markdown("**{}**".format(heading))
+            for value in values:
+                st.markdown("- {}".format(value))
+    for persona in prd.personas:
+        st.markdown("**Persona — {}** {}".format(persona.name, persona.description))
+    for feature in prd.features:
+        st.markdown(
+            "**{} {}** — serves {}".format(
+                feature.feature_id, feature.name, ", ".join(feature.requirement_ids)
+            )
+        )
+        for label, values in (
+            ("Behaviour", feature.behaviours),
+            ("Edge cases", feature.edge_cases),
+            ("Acceptance criteria", feature.acceptance_criteria),
+        ):
+            for value in values:
+                st.markdown("- _{}_: {}".format(label, value))
+    for journey in prd.journeys:
+        st.markdown("**Journey — {}**".format(journey.name))
+        for step in journey.steps:
+            st.markdown("- {}".format(step))
+
+
+def _render_prd_stage(lifecycle) -> None:
+    """
+    The PRD stage: generate from the approved BRD, review, edit, then approve explicitly.
+
+    Blocked safely when there is no BRD or the BRD is not approved: the stage says what
+    is missing instead of offering a control that would have to invent requirements.
+    """
+    if lifecycle.brd is None:
+        st.info(
+            "No BRD in this session yet. Generate one at the top of this page; the PRD "
+            "is derived from the approved BRD."
+        )
+        return
+    if not _brd_approved():
+        st.info(
+            "The BRD is pending review. Open the Discovery → BRD stage and approve it to "
+            "generate a PRD from it."
+        )
+        return
+
+    refinement = _prd_refinement()
+    prd = _held_prd()
+
+    if st.button("Generate PRD from the approved BRD", key="generate_prd"):
+        _clear_prd_widgets()
+        st.session_state.pop(PRD_APPROVED_SESSION_KEY, None)
+        with st.spinner("Deriving the product definition from the approved BRD..."):
+            prd = _persist_prd(
+                generate_prd(lifecycle.brd, refinement, generate=_planner_generate())
+            )
+
+    if prd is None:
+        st.caption(
+            "Not generated yet. This derives product overview, personas, features, "
+            "journeys, behaviour, edge cases and acceptance criteria from the approved "
+            "BRD. It creates nothing outside this session."
+        )
+        return
+
+    for note in prd.notes:
+        st.warning(note)
+
+    if prd.is_empty:
+        st.caption(
+            "No PRD content could be derived. Nothing has been approved and nothing "
+            "downstream was generated."
+        )
+        return
+
+    if prd.refinement_source:
+        st.caption(
+            "A product-refinement discussion ({}) was supplied alongside the BRD.".format(
+                prd.refinement_source
+            )
+        )
+    _render_prd_traceability(prd)
+
+    if bool(st.session_state.get(PRD_APPROVED_SESSION_KEY)):
+        st.success("This PRD is approved.")
+        _render_prd_readonly(prd)
+        if st.button("Revoke PRD approval to edit", key="revoke_prd_approval"):
+            st.session_state[PRD_APPROVED_SESSION_KEY] = False
+        return
+
+    prd = _render_prd_editor(prd)
+    st.caption(
+        "Approving records that you reviewed this PRD. Later stages -- architecture, "
+        "implementation plan, sprints and tests -- are not implemented yet, so nothing "
+        "downstream is generated."
+    )
+    if st.button("Approve PRD", key="approve_prd"):
+        st.session_state[PRD_APPROVED_SESSION_KEY] = True
+        _flash("success", "PRD approved.")
+
+
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
     """
     One stage: its status, and either where it already lives or that it is not built.
@@ -2039,6 +2433,9 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
                 "The BRD, its evidence validation and its Markdown export are rendered "
                 "above. This stage reports its state; it does not repeat it."
             )
+            _render_brd_approval()
+    elif stage == PRD:
+        _render_prd_stage(lifecycle)
     elif stage == DELIVERY_STATUS:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "
@@ -2064,17 +2461,21 @@ def _render_lifecycle_workspace() -> None:
     st.divider()
     st.subheader("Project delivery lifecycle")
     st.caption(
-        "The delivery flow this project is being built towards. Discovery → BRD and the "
-        "Jira delivery stage are implemented; the stages between them are navigable and "
-        "report that they are not implemented yet."
+        "The delivery flow this project is being built towards. Discovery → BRD, "
+        "Product Definition → PRD and the Jira delivery stage are implemented; the "
+        "stages between them are navigable and report that they are not implemented yet."
     )
 
     brd_data = st.session_state.get(BRD_SESSION_KEY)
+    prd_data = st.session_state.get(PRD_SESSION_KEY)
     lifecycle = lifecycle_from(
         brd=brd_data if isinstance(brd_data, BRDData) else None,
         discovery_source=str(st.session_state.get(BRD_SOURCE_SESSION_KEY) or ""),
         plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
         created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
+        brd_approved=_brd_approved(),
+        prd=prd_data if isinstance(prd_data, PRDData) else None,
+        prd_approved=bool(st.session_state.get(PRD_APPROVED_SESSION_KEY)),
     )
 
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):
