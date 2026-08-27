@@ -22,6 +22,7 @@ from lifecycle_models import (
     DELIVERY_STATUS,
     DISCOVERY_BRD,
     DRAFT,
+    IMPLEMENTATION_PLAN,
     IMPLEMENTED_STAGES,
     IN_PROGRESS,
     LIFECYCLE_STAGES,
@@ -58,7 +59,13 @@ def test_the_lifecycle_is_the_eight_stages_in_delivery_order():
         "Jira / Delivery Status",
     ]
     # Only what is built is claimed as built.
-    assert IMPLEMENTED_STAGES == (DISCOVERY_BRD, PRD, ARCHITECTURE, DELIVERY_STATUS)
+    assert IMPLEMENTED_STAGES == (
+        DISCOVERY_BRD,
+        PRD,
+        ARCHITECTURE,
+        IMPLEMENTATION_PLAN,
+        DELIVERY_STATUS,
+    )
 
 
 @pytest.mark.parametrize(
