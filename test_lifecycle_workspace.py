@@ -18,6 +18,7 @@ from brd_models import BRDData, ProjectOverview, Requirement
 from jira_models import CreatedIssue
 from lifecycle_models import (
     APPROVED,
+    ARCHITECTURE,
     DELIVERY_STATUS,
     DISCOVERY_BRD,
     DRAFT,
@@ -57,7 +58,7 @@ def test_the_lifecycle_is_the_eight_stages_in_delivery_order():
         "Jira / Delivery Status",
     ]
     # Only what is built is claimed as built.
-    assert IMPLEMENTED_STAGES == (DISCOVERY_BRD, PRD, DELIVERY_STATUS)
+    assert IMPLEMENTED_STAGES == (DISCOVERY_BRD, PRD, ARCHITECTURE, DELIVERY_STATUS)
 
 
 @pytest.mark.parametrize(
@@ -107,9 +108,9 @@ def test_the_later_stages_report_that_they_are_not_implemented():
     later = [
         stage
         for stage in LIFECYCLE_STAGES
-        if stage not in (DISCOVERY_BRD, PRD, DELIVERY_STATUS)
+        if stage not in IMPLEMENTED_STAGES
     ]
-    assert later, "the lifecycle should have stages beyond the three that are built"
+    assert later, "the lifecycle should have stages beyond the ones that are built"
     for stage in later:
         state = lifecycle.state(stage)
         assert state.status == NOT_STARTED, stage

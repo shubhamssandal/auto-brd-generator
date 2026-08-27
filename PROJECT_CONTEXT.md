@@ -360,6 +360,20 @@ Validation logic should remain simple, transparent, and easy to explain during a
 
 The MVP should prioritize reliability and traceability over unnecessary AI complexity.
 
+Traceability in the later lifecycle stages reuses the identifiers the previous artifact
+already minted: a PRD feature names BRD requirement ids, and an architecture component
+names PRD feature ids. No stage introduces a second identifier scheme.
+
+Traceability is enforced differently for the PRD and the architecture, deliberately. A PRD
+feature that names no BRD requirement is invented product scope and is dropped. An
+architecture component that names no PRD feature is *kept* and counted in the artifact's
+notes, because an API gateway, a shared auth service or a CI pipeline is genuinely
+cross-cutting and dropping it would delete real technical design.
+
+An architecture component's layer (backend, web, mobile) is determined by the section of
+the model response it arrived in, never by a layer the model asserts about itself. Only a
+component in a generic list has its layer inferred, and the inference is recorded.
+
 ---
 
 # Planned Development Order

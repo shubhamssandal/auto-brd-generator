@@ -4,7 +4,7 @@ This project is a Streamlit web application for an AI-assisted software delivery
 
 > **Discovery → BRD → PRD → Architecture → Implementation Plan → Sprint Planning → Test Cases → Test Execution → Jira / Delivery Status**
 
-Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), derives a Product Requirements Document (PRD) from an approved BRD, and optionally delivers the reviewed requirements into Jira as traceable issues. The stages between the PRD and Jira delivery — architecture, implementation plan, sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [BRD to PRD](#brd-to-prd) and [What Has Actually Been Verified](#what-has-actually-been-verified) for exactly what is built and what is planned.
+Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), derives a Product Requirements Document (PRD) from an approved BRD, derives a technical architecture from an approved PRD, and optionally delivers the reviewed requirements into Jira as traceable issues. The remaining stages — implementation plan, sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [BRD to PRD](#brd-to-prd), [PRD to Architecture](#prd-to-architecture) and [What Has Actually Been Verified](#what-has-actually-been-verified) for exactly what is built and what is planned.
 
 It is designed as a portfolio piece to demonstrate skills in business analysis, requirements engineering, and the responsible application of Large Language Models (LLMs).
 
@@ -51,6 +51,9 @@ All four ingestion sources normalize into one `NormalizedTranscript` and then fl
         Explicit BRD approval → PRD generation  (+ optional
         product-refinement transcript) → review/edit → approval
                                 ▼
+        Explicit PRD approval → Architecture generation  (+ optional
+        architecture discussion) → review/edit → approval
+                                ▼
         Optional Jira delivery  (OAuth 2.0 3LO + Atlassian REST)
         site → project → required fields → work plan → review
                  → explicit confirmation → issue creation
@@ -67,6 +70,8 @@ Everything after the Markdown export is optional. A BRD is complete without it, 
 | `brd_models.py`               | `NormalizedTranscript` and the BRD dataclasses                                                                            |
 | `prd_models.py`               | PRD dataclasses: `Feature`, `Persona`, `UserJourney`, `PRDData`, and BRD-requirement traceability                          |
 | `prd_generator.py`            | Approved BRD → PRD prompt, untrusted-response validation, deterministic baseline fallback                                  |
+| `architecture_models.py`      | Architecture dataclasses: `Component`, `Decision`, `DataFlow`, `Integration`, `Risk`, `ArchitectureData`, PRD-feature traceability |
+| `architecture_generator.py`   | Approved PRD → architecture prompt, untrusted-response validation, deterministic baseline fallback                          |
 | `model_output.py`             | Shared reader for untrusted model output: JSON extraction, field aliases, safe error messages                              |
 | `transcript_processor.py`     | Manual-paste and `.txt` upload normalization                                                                              |
 | `providers/base.py`           | `TranscriptProvider` contract and the provider error hierarchy                                                            |
@@ -179,6 +184,17 @@ An **approved** BRD can be turned into a Product Requirements Document from the 
 - **Failure degrades instead of inventing.** With no model configured, an unreachable provider, or a response that cannot be read, the stage falls back to a deterministic one-feature-per-requirement draft and says why in a note. Provider failures report the exception type only, never the client's message.
 - **A new BRD invalidates what came from the old one.** Regenerating or re-storing a BRD clears its approval, the PRD, the PRD's approval and the review editor's state.
 
+## PRD to Architecture
+
+An **approved** PRD can be turned into a technical architecture from the "Architecture" stage in the project workspace. The architecture is a translation of the PRD, not a restatement: it names the backend services, web application areas and mobile modules that realise the product, with each component's responsibility, API boundaries, owned data and dependencies, plus core domains, authentication and authorization, system data flows, external integrations, architecture decisions, technical dependencies and technical risks.
+
+- **The approved PRD is the input.** No transcript is required. An architecture or design discussion can optionally be pasted in to add technical evidence, and the source it came from is recorded on the architecture.
+- **Approval gates the stage.** The stage offers no generation control until the PRD has been approved through its own button, and generating an architecture leaves it at *Pending Review*. Editing it keeps it there. Only the "Approve architecture" button moves it to *Approved*.
+- **Traceability is structural, and cross-cutting design survives it.** Components, decisions, flows and integrations name the PRD feature ids they realise, reusing the ids already in the PRD. Feature ids the PRD does not hold are removed. Unlike a PRD feature, a component that names no feature is **kept** — a gateway or shared auth service is genuinely cross-cutting — and counted in the architecture's notes so a reviewer sees it. Uncovered PRD features and a layer with no component are reported the same way.
+- **A component's layer comes from the section it arrived in**, not from anything the model asserts about itself. Only a component in a generic list has its layer inferred, and that inference is noted.
+- **Failure degrades instead of inventing.** With no model configured, an unreachable provider, or a response that cannot be read, the stage falls back to a deterministic skeleton — one component per PRD feature in each layer, with no decisions, flows or risks — and says why in a note. Provider failures report the exception type only, never the client's message.
+- **A new PRD invalidates the architecture designed against the old one.** Regenerating the PRD clears the architecture, its approval and the review editor's state.
+
 ## Optional Jira Delivery
 
 A reviewed BRD can be turned into Jira issues without leaving the app. The panel appears under the BRD and takes five explicit steps: choose a Jira site, choose a project, check what that project's issue types actually require, generate a work plan, and create the selected issues.
@@ -243,7 +259,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 ./brd-env/bin/pytest -q
 ```
 
-**Last run: 528 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
+**Last run: 569 passed.** Every external API call is monkeypatched, so no Google, Microsoft, Atlassian or Gemini credentials are needed to run the suite and no network access is required. A test-wide fixture also blanks the Gemini client, so no test can reach a live model.
 
 | File                            | Covers                                                                                                                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -263,6 +279,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | `test_jira_creation.py`         | Confirmation gating, parents-before-children ordering, partial-failure reporting, `CreatedIssue` mapping, no request on a rerun                                                                                                                   |
 | `test_lifecycle_workspace.py`   | Lifecycle stage ordering, state vocabulary enforcement, derived status from session artifacts, workspace rendering, JIRA-010 removal assertions                                                                                                   |
 | `test_prd.py`                   | Approved BRD → PRD generation, the approval gate, optional refinement transcript, BRD → PRD traceability, review/edit persistence, explicit approval, provider and malformed-response fallbacks                                                    |
+| `test_architecture.py`          | Approved PRD → architecture generation, the PRD gate, backend/web/mobile coverage, optional architecture discussion, PRD → architecture traceability, layer resolution, review/edit persistence, explicit approval, provider and malformed-response fallbacks |
 
 ## What Has Actually Been Verified
 
@@ -276,6 +293,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | Jira work-plan generation, validation, review and confirmation gating | Covered by tests; no network involved in building or reviewing a plan                                                                                                              |
 | Lifecycle workspace: all 8 stages, derived status, no JIRA-010 drift  | Covered by `test_lifecycle_workspace.py`                                                                                                                                           |
 | Approved BRD → PRD, traceability, review/edit and explicit approval   | Covered by `test_prd.py`; the model is injected as a callable, so no PRD test reaches a provider                                                                                    |
+| Approved PRD → Architecture, traceability, review/edit and approval   | Covered by `test_architecture.py`; the model is injected as a callable, so no architecture test reaches a provider                                                                  |
 | **Live Google Meet transcript retrieval**                             | **Not verified.** Requires real `GOOGLE_WORKSPACE_*` credentials and a Google Workspace account with Meet transcription enabled.                                                   |
 | **Live Microsoft Teams transcript retrieval**                         | **Not verified.** Requires a real Entra ID app registration, `AZURE_*` credentials, and tenant admin consent.                                                                      |
 | **Live Jira issue creation**                                          | **Not verified in this repository.** All Jira tests run against mocked Atlassian responses; a real end-to-end run needs a Jira Cloud site and an app with the five scopes granted. |
@@ -290,6 +308,6 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 - **Verbatim evidence check.** Validation uses exact substring containment, so a paraphrased quote is demoted to an Assumption even when the underlying point is real.
 - **Stateless operation.** Nothing is persisted between sessions; tokens vanish when the session ends and BRD drafts are downloaded as Markdown.
 - **A stale plan is tolerated, not corrected.** After a BRD is regenerated, a previously generated work plan still restates the older wording until it is regenerated.
-- **The PRD stops at approval.** Nothing consumes an approved PRD yet — architecture, implementation plan, sprint planning, test cases and test execution are not implemented — and the PRD has no Markdown export of its own, so it lives only in the session.
+- **The architecture stops at approval.** Nothing consumes an approved architecture yet — the implementation plan, sprint planning, test cases and test execution are not implemented — and neither the PRD nor the architecture has a Markdown export of its own, so both live only in the session.
 - **OAuth state does not survive a restart** unless `OAUTH_STATE_SECRET` is set, because the signing key is otherwise generated per process. An in-flight sign-in must be restarted.
 - **Prompt sensitivity.** Output quality is bounded by the clarity and completeness of the source notes.

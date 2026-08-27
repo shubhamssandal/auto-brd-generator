@@ -23,8 +23,11 @@ from transcript_processor import (
     TranscriptProcessingError,
 )
 from jira_models import CreatedIssue
+from architecture_generator import generate_architecture
+from architecture_models import LAYERS, LAYER_LABEL, ArchitectureData
 from lifecycle_models import (
     APPROVED,
+    ARCHITECTURE,
     DELIVERY_STATUS,
     DISCOVERY_BRD,
     IMPLEMENTED_STAGES,
@@ -657,11 +660,40 @@ PRD_REFINEMENT_SESSION_KEY = "prd_refinement"
 # cannot inherit the previous one's editor values.
 _PRD_WIDGET_PREFIX = "prd_review__"
 
+# The architecture derived from the approved PRD, whether the reviewer approved it, and
+# the optional architecture-discussion transcript that informed it.
+ARCHITECTURE_SESSION_KEY = "architecture_data"
+ARCHITECTURE_APPROVED_SESSION_KEY = "architecture_approved"
+ARCHITECTURE_DISCUSSION_SESSION_KEY = "architecture_discussion"
+
+# Widget keys for the architecture review editors, under their own prefix for the same
+# reason as the PRD's.
+_ARCH_WIDGET_PREFIX = "arch_review__"
+
 
 def _clear_prd_widgets() -> None:
     """Drop PRD review-editor widget state."""
     for key in list(st.session_state.keys()):
         if str(key).startswith(_PRD_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_architecture_state() -> None:
+    """
+    Forget the architecture, its approval and its editors.
+
+    Called when the PRD changes for the same reason ``_clear_prd_state`` is called when
+    the BRD changes: an architecture is the design for one specific PRD, so a new PRD
+    makes a held architecture wrong rather than merely old.
+    """
+    for key in (
+        ARCHITECTURE_SESSION_KEY,
+        ARCHITECTURE_APPROVED_SESSION_KEY,
+        ARCHITECTURE_DISCUSSION_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_ARCH_WIDGET_PREFIX):
             st.session_state.pop(key, None)
 
 
@@ -671,11 +703,14 @@ def _clear_prd_state() -> None:
 
     Called when the BRD changes: a PRD is a product definition of one specific BRD, so
     a new BRD makes a held PRD wrong rather than merely old, and its approval cannot
-    carry over to a document nobody has reviewed.
+    carry over to a document nobody has reviewed. The architecture derived from that PRD
+    goes with it.
     """
     for key in (PRD_SESSION_KEY, PRD_APPROVED_SESSION_KEY, PRD_REFINEMENT_SESSION_KEY):
         st.session_state.pop(key, None)
     _clear_prd_widgets()
+    _clear_architecture_state()
+
 
 # Streamlit widget keys for the work-plan review editors. Not under ``jira__``:
 # those suffixes are plan data, and a leftover text-input value would otherwise
@@ -2359,6 +2394,8 @@ def _render_prd_stage(lifecycle) -> None:
     if st.button("Generate PRD from the approved BRD", key="generate_prd"):
         _clear_prd_widgets()
         st.session_state.pop(PRD_APPROVED_SESSION_KEY, None)
+        # A new PRD invalidates the architecture designed against the previous one.
+        _clear_architecture_state()
         with st.spinner("Deriving the product definition from the approved BRD..."):
             prd = _persist_prd(
                 generate_prd(lifecycle.brd, refinement, generate=_planner_generate())
@@ -2405,7 +2442,375 @@ def _render_prd_stage(lifecycle) -> None:
     )
     if st.button("Approve PRD", key="approve_prd"):
         st.session_state[PRD_APPROVED_SESSION_KEY] = True
-        _flash("success", "PRD approved.")
+        _flash("success", "PRD approved. The architecture can now be generated from it.")
+
+
+def _prd_approved() -> bool:
+    return bool(st.session_state.get(PRD_APPROVED_SESSION_KEY))
+
+
+def _held_architecture():
+    architecture = st.session_state.get(ARCHITECTURE_SESSION_KEY)
+    return architecture if isinstance(architecture, ArchitectureData) else None
+
+
+def _persist_architecture(architecture: ArchitectureData) -> ArchitectureData:
+    st.session_state[ARCHITECTURE_SESSION_KEY] = architecture
+    return architecture
+
+
+def _architecture_discussion() -> Optional[NormalizedTranscript]:
+    """
+    The optional architecture or design discussion, if the reviewer supplied one.
+
+    Optional by design: the architecture is derived from the approved PRD, and this only
+    adds technical evidence -- a decision already taken, a constraint already known.
+    """
+    with st.expander("Optional architecture discussion"):
+        st.caption(
+            "Not required. The architecture is generated from the approved PRD; a design "
+            "discussion only adds technical evidence on top of it."
+        )
+        pasted = st.text_area(
+            "Paste an architecture or design discussion (optional)",
+            value="",
+            key=_ARCH_WIDGET_PREFIX + "discussion_text",
+            height=140,
+        )
+        text = str(pasted or "").strip()
+        if not text:
+            st.session_state.pop(ARCHITECTURE_DISCUSSION_SESSION_KEY, None)
+            return None
+        transcript = NormalizedTranscript(raw_text=text, source="manual")
+        st.session_state[ARCHITECTURE_DISCUSSION_SESSION_KEY] = transcript
+        return transcript
+
+
+def _render_architecture_traceability(architecture: ArchitectureData, prd: PRDData) -> None:
+    """Which PRD features this architecture realises, which it does not, and whether it is stale."""
+    covered = architecture.covered_feature_ids
+    st.caption(
+        "Traceability: {} of {} PRD feature(s) realised — {}".format(
+            len(covered),
+            len(architecture.source_feature_ids),
+            ", ".join(covered) if covered else "none",
+        )
+    )
+    if architecture.uncovered_feature_ids:
+        st.warning(
+            "Not realised by any component, decision or flow: {}. Either that is "
+            "deliberate, or the architecture is incomplete.".format(
+                ", ".join(architecture.uncovered_feature_ids)
+            )
+        )
+    current = tuple(feature.feature_id for feature in prd.features)
+    if current != tuple(architecture.source_feature_ids):
+        st.warning(
+            "The PRD's features changed after this architecture was generated. Regenerate "
+            "it so the design matches the approved PRD."
+        )
+
+
+def _arch_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(label, value=_criteria_text(values), key=_ARCH_WIDGET_PREFIX + suffix)
+    )
+
+
+def _render_architecture_editor(architecture: ArchitectureData) -> ArchitectureData:
+    """
+    The review and edit surface: every edit is kept, and none of them approves anything.
+
+    Feature ids are shown but not editable, for the reason the PRD editor does not let
+    requirement ids be typed over: traceability is derived from the artifact upstream, so
+    letting it be rewritten here would let a reviewer claim coverage the PRD does not
+    support.
+    """
+    overview = st.text_area(
+        "Architecture overview",
+        value=architecture.overview,
+        key=_ARCH_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    domains = _arch_lines("Core domains (one per line)", architecture.domains, "domains")
+    auth = _arch_lines(
+        "Authentication and authorization (one per line)",
+        architecture.auth_approach,
+        "auth",
+    )
+    dependencies = _arch_lines(
+        "Technical dependencies (one per line)", architecture.dependencies, "dependencies"
+    )
+
+    components = []
+    for layer in LAYERS:
+        in_layer = architecture.layer(layer)
+        st.markdown("**{}** — {} component(s)".format(LAYER_LABEL[layer], len(in_layer)))
+        for component in in_layer:
+            with st.expander("{} — {}".format(component.component_id, component.name)):
+                st.caption(
+                    "Realises PRD feature(s): {}".format(
+                        ", ".join(component.feature_ids) or "none — cross-cutting"
+                    )
+                )
+                components.append(
+                    replace(
+                        component,
+                        name=st.text_input(
+                            "Component name",
+                            value=component.name,
+                            key="{}{}_name".format(_ARCH_WIDGET_PREFIX, component.component_id),
+                        ),
+                        responsibility=st.text_area(
+                            "Responsibility",
+                            value=component.responsibility,
+                            key="{}{}_responsibility".format(
+                                _ARCH_WIDGET_PREFIX, component.component_id
+                            ),
+                        ),
+                        apis=_arch_lines(
+                            "API boundaries (one per line)",
+                            component.apis,
+                            "{}_apis".format(component.component_id),
+                        ),
+                        data=_arch_lines(
+                            "Data or state owned (one per line)",
+                            component.data,
+                            "{}_data".format(component.component_id),
+                        ),
+                        dependencies=_arch_lines(
+                            "Dependencies (one per line)",
+                            component.dependencies,
+                            "{}_dependencies".format(component.component_id),
+                        ),
+                    )
+                )
+
+    decisions = []
+    for decision in architecture.decisions:
+        with st.expander("{} — {}".format(decision.decision_id, decision.title)):
+            decisions.append(
+                replace(
+                    decision,
+                    choice=st.text_area(
+                        "Choice",
+                        value=decision.choice,
+                        key="{}{}_choice".format(_ARCH_WIDGET_PREFIX, decision.decision_id),
+                    ),
+                    rationale=st.text_area(
+                        "Rationale",
+                        value=decision.rationale,
+                        key="{}{}_rationale".format(_ARCH_WIDGET_PREFIX, decision.decision_id),
+                    ),
+                )
+            )
+
+    flows = []
+    for position, flow in enumerate(architecture.flows, start=1):
+        with st.expander("Flow — {}".format(flow.name)):
+            flows.append(
+                replace(
+                    flow,
+                    steps=_arch_lines(
+                        "Steps, in order (one per line)",
+                        flow.steps,
+                        "flow_{}_steps".format(position),
+                    ),
+                )
+            )
+
+    integrations = []
+    for position, integration in enumerate(architecture.integrations, start=1):
+        with st.expander("Integration — {}".format(integration.name)):
+            integrations.append(
+                replace(
+                    integration,
+                    purpose=st.text_area(
+                        "Purpose",
+                        value=integration.purpose,
+                        key="{}integration_{}_purpose".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                    direction=st.text_input(
+                        "Direction",
+                        value=integration.direction,
+                        key="{}integration_{}_direction".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                )
+            )
+
+    risks = []
+    for position, risk in enumerate(architecture.risks, start=1):
+        with st.expander("Risk — {}".format(risk.statement)):
+            risks.append(
+                replace(
+                    risk,
+                    impact=st.text_area(
+                        "Impact",
+                        value=risk.impact,
+                        key="{}risk_{}_impact".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                    mitigation=st.text_area(
+                        "Mitigation",
+                        value=risk.mitigation,
+                        key="{}risk_{}_mitigation".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                )
+            )
+
+    edited = replace(
+        architecture,
+        overview=overview,
+        domains=domains,
+        auth_approach=auth,
+        dependencies=dependencies,
+        components=tuple(components),
+        decisions=tuple(decisions),
+        flows=tuple(flows),
+        integrations=tuple(integrations),
+        risks=tuple(risks),
+    )
+    if edited != architecture:
+        # Editing keeps the architecture pending review. Only the approval button approves it.
+        return _persist_architecture(edited)
+    return architecture
+
+
+def _render_architecture_readonly(architecture: ArchitectureData) -> None:
+    """The approved architecture, shown rather than offered for editing."""
+    if architecture.overview:
+        st.markdown(architecture.overview)
+    for heading, values in (
+        ("Core domains", architecture.domains),
+        ("Authentication and authorization", architecture.auth_approach),
+        ("Technical dependencies", architecture.dependencies),
+    ):
+        if values:
+            st.markdown("**{}**".format(heading))
+            for value in values:
+                st.markdown("- {}".format(value))
+    for layer in LAYERS:
+        in_layer = architecture.layer(layer)
+        if not in_layer:
+            continue
+        st.markdown("**{}**".format(LAYER_LABEL[layer]))
+        for component in in_layer:
+            st.markdown(
+                "- **{} {}** — realises {}: {}".format(
+                    component.component_id,
+                    component.name,
+                    ", ".join(component.feature_ids) or "cross-cutting",
+                    component.responsibility,
+                )
+            )
+            for label, values in (
+                ("API", component.apis),
+                ("Data", component.data),
+                ("Depends on", component.dependencies),
+            ):
+                for value in values:
+                    st.markdown("    - _{}_: {}".format(label, value))
+    for decision in architecture.decisions:
+        st.markdown(
+            "**{} {}** — {} ({})".format(
+                decision.decision_id, decision.title, decision.choice, decision.rationale
+            )
+        )
+    for flow in architecture.flows:
+        st.markdown("**Flow — {}**".format(flow.name))
+        for step in flow.steps:
+            st.markdown("- {}".format(step))
+    for integration in architecture.integrations:
+        st.markdown(
+            "**Integration — {}** {} {}".format(
+                integration.name, integration.direction, integration.purpose
+            )
+        )
+    for risk in architecture.risks:
+        st.markdown(
+            "**Risk — {}** impact: {} mitigation: {}".format(
+                risk.statement, risk.impact, risk.mitigation
+            )
+        )
+
+
+def _render_architecture_stage(lifecycle) -> None:
+    """
+    The architecture stage: generate from the approved PRD, review, edit, approve explicitly.
+
+    Blocked safely when there is no PRD or the PRD is not approved: the stage says what is
+    missing instead of offering a control that would have to invent product scope.
+    """
+    prd = lifecycle.prd
+    if prd is None or prd.is_empty:
+        st.info(
+            "No PRD in this session yet. Open the Product Definition → PRD stage and "
+            "generate one; the architecture is derived from the approved PRD."
+        )
+        return
+    if not _prd_approved() or not _brd_approved():
+        st.info(
+            "The PRD is pending review. Open the Product Definition → PRD stage and "
+            "approve it to generate an architecture from it."
+        )
+        return
+
+    discussion = _architecture_discussion()
+    architecture = _held_architecture()
+
+    if st.button("Generate architecture from the approved PRD", key="generate_architecture"):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_ARCH_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(ARCHITECTURE_APPROVED_SESSION_KEY, None)
+        with st.spinner("Deriving the technical architecture from the approved PRD..."):
+            architecture = _persist_architecture(
+                generate_architecture(prd, discussion, generate=_planner_generate())
+            )
+
+    if architecture is None:
+        st.caption(
+            "Not generated yet. This derives backend, web and mobile components, API "
+            "boundaries, data ownership, authentication, data flows, integrations, "
+            "decisions, dependencies and technical risks from the approved PRD. It "
+            "creates nothing outside this session."
+        )
+        return
+
+    for note in architecture.notes:
+        st.warning(note)
+
+    if architecture.is_empty:
+        st.caption(
+            "No architecture content could be derived. Nothing has been approved and "
+            "nothing downstream was generated."
+        )
+        return
+
+    if architecture.discussion_source:
+        st.caption(
+            "An architecture discussion ({}) was supplied alongside the PRD.".format(
+                architecture.discussion_source
+            )
+        )
+    _render_architecture_traceability(architecture, prd)
+
+    if bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY)):
+        st.success("This architecture is approved.")
+        _render_architecture_readonly(architecture)
+        if st.button("Revoke architecture approval to edit", key="revoke_architecture_approval"):
+            st.session_state[ARCHITECTURE_APPROVED_SESSION_KEY] = False
+        return
+
+    architecture = _render_architecture_editor(architecture)
+    st.caption(
+        "Approving records that you reviewed this architecture. Later stages -- "
+        "implementation plan, sprints and tests -- are not implemented yet, so nothing "
+        "downstream is generated."
+    )
+    if st.button("Approve architecture", key="approve_architecture"):
+        st.session_state[ARCHITECTURE_APPROVED_SESSION_KEY] = True
+        _flash("success", "Architecture approved.")
 
 
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
@@ -2436,6 +2841,8 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
             _render_brd_approval()
     elif stage == PRD:
         _render_prd_stage(lifecycle)
+    elif stage == ARCHITECTURE:
+        _render_architecture_stage(lifecycle)
     elif stage == DELIVERY_STATUS:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "
@@ -2462,12 +2869,14 @@ def _render_lifecycle_workspace() -> None:
     st.subheader("Project delivery lifecycle")
     st.caption(
         "The delivery flow this project is being built towards. Discovery → BRD, "
-        "Product Definition → PRD and the Jira delivery stage are implemented; the "
-        "stages between them are navigable and report that they are not implemented yet."
+        "Product Definition → PRD, Architecture and the Jira delivery stage are "
+        "implemented; the stages between them are navigable and report that they are "
+        "not implemented yet."
     )
 
     brd_data = st.session_state.get(BRD_SESSION_KEY)
     prd_data = st.session_state.get(PRD_SESSION_KEY)
+    architecture_data = st.session_state.get(ARCHITECTURE_SESSION_KEY)
     lifecycle = lifecycle_from(
         brd=brd_data if isinstance(brd_data, BRDData) else None,
         discovery_source=str(st.session_state.get(BRD_SOURCE_SESSION_KEY) or ""),
@@ -2476,6 +2885,10 @@ def _render_lifecycle_workspace() -> None:
         brd_approved=_brd_approved(),
         prd=prd_data if isinstance(prd_data, PRDData) else None,
         prd_approved=bool(st.session_state.get(PRD_APPROVED_SESSION_KEY)),
+        architecture=(
+            architecture_data if isinstance(architecture_data, ArchitectureData) else None
+        ),
+        architecture_approved=bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY)),
     )
 
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):
