@@ -45,6 +45,7 @@ from lifecycle_models import (
     LIFECYCLE_STAGES,
     PRD,
     STAGE_LABEL,
+    TEST_CASES,
     lifecycle_from,
 )
 from jira_planner import action_item_index, generate_work_plan
@@ -58,6 +59,8 @@ from implementation_plan_jira import (
 )
 from prd_generator import generate_prd
 from prd_models import PRDData
+from test_case_generator import generate_test_suite, _fallback_test_suite
+from test_case_models import TestCase, TestSuite
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -710,11 +713,32 @@ IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY = "implementation_plan_approved"
 # same reason as the PRD's and the architecture's.
 _PLAN_WIDGET_PREFIX = "plan_review__"
 
+# The test cases derived from the approved implementation plan, and whether the reviewer approved them.
+TEST_CASES_SESSION_KEY = "test_cases_data"
+TEST_CASES_APPROVED_SESSION_KEY = "test_cases_approved"
+
+# Widget keys for the test cases review editors, under their own prefix.
+_TEST_CASES_WIDGET_PREFIX = "test_cases_review__"
+
 
 def _clear_prd_widgets() -> None:
     """Drop PRD review-editor widget state."""
     for key in list(st.session_state.keys()):
         if str(key).startswith(_PRD_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_test_cases_state() -> None:
+    """
+    Forget the test cases, their approval, and their review editors.
+    """
+    for key in (
+        TEST_CASES_SESSION_KEY,
+        TEST_CASES_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
             st.session_state.pop(key, None)
 
 
@@ -735,6 +759,7 @@ def _clear_implementation_plan_state() -> None:
     for key in list(st.session_state.keys()):
         if str(key).startswith(_PLAN_WIDGET_PREFIX):
             st.session_state.pop(key, None)
+    _clear_test_cases_state()
 
 
 def _clear_architecture_state() -> None:
@@ -756,6 +781,7 @@ def _clear_architecture_state() -> None:
         if str(key).startswith(_ARCH_WIDGET_PREFIX):
             st.session_state.pop(key, None)
     _clear_implementation_plan_state()
+    _clear_test_cases_state()
 
 
 def _clear_prd_state() -> None:
@@ -3097,7 +3123,18 @@ def _held_implementation_plan():
 
 def _persist_implementation_plan(plan: ImplementationPlan) -> ImplementationPlan:
     st.session_state[IMPLEMENTATION_PLAN_SESSION_KEY] = plan
+    _clear_test_cases_state()
     return plan
+
+
+def _held_test_cases():
+    test_cases = st.session_state.get(TEST_CASES_SESSION_KEY)
+    return test_cases if isinstance(test_cases, (list, tuple)) else None
+
+
+def _persist_test_cases(test_cases) -> list:
+    st.session_state[TEST_CASES_SESSION_KEY] = test_cases
+    return test_cases
 
 
 def _render_plan_traceability(
@@ -3417,6 +3454,167 @@ def _render_plan_readonly(plan: ImplementationPlan) -> None:
         st.caption("Dependency order: {}".format(" → ".join(order)))
 
 
+def _render_test_case_traceability(test_cases: list[TestSuite], plan: ImplementationPlan) -> None:
+    """Show traceability from test cases back to stories and requirements."""
+    if not test_cases:
+        st.caption("No test cases to show traceability for.")
+        return
+
+    # Group test cases by story reference
+    test_cases_by_story = {}
+    for suite in test_cases:
+        for tc in suite.test_cases:
+            story_ref = tc.story_reference
+            if story_ref not in test_cases_by_story:
+                test_cases_by_story[story_ref] = []
+            test_cases_by_story[story_ref].append(tc)
+
+    st.caption(
+        f"Traceability: {sum(len(suite.test_cases) for suite in test_cases)} test case(s) covering "
+        f"{len(test_cases_by_story)} story(s) from the implementation plan."
+    )
+
+    # Show which stories have test cases
+    story_ids_with_tests = set(test_cases_by_story.keys())
+    all_story_ids = {story.story_id for story in plan.stories}
+    stories_without_tests = all_story_ids - story_ids_with_tests
+
+    if stories_without_tests:
+        st.warning(
+            "No test cases generated for story(s): {}. Either that is deliberate — "
+            "record it as an open question — or test case generation is incomplete.".format(
+                ", ".join(sorted(stories_without_tests))
+            )
+        )
+
+
+def _render_test_case_readonly(test_cases: list[TestSuite]) -> None:
+    """The approved test cases, shown rather than offered for editing."""
+    if not test_cases:
+        st.caption("No test cases available.")
+        return
+
+    for suite in test_cases:
+        st.markdown("**Test Suite for Story {}**".format(suite.story_id))
+        for test_case in suite.test_cases:
+            st.markdown(
+                "- **{}** [{}] — {}".format(
+                    test_case.test_id,
+                    test_case.priority,
+                    test_case.scenario,
+                )
+            )
+            if test_case.preconditions:
+                st.markdown("    - _Preconditions_: {}".format(test_case.preconditions))
+            if test_case.steps:
+                st.markdown("    - _Steps_: {}".format(test_case.steps))
+            if test_case.expected_result:
+                st.markdown("    - _Expected Result_: {}".format(test_case.expected_result))
+            st.markdown("    - _Type_: {}".format(test_case.test_type))
+
+    st.caption("These test cases are approved and ready for execution.")
+
+
+def _render_test_case_editor(test_cases: list[TestSuite]) -> list[TestSuite]:
+    """Review and edit surface for test cases: every edit is kept, and none of them approves anything.
+
+    Test IDs are shown but not editable to preserve traceability.
+    Story reference is shown but not editable to preserve traceability.
+    """
+    if not test_cases:
+        st.caption("No test cases to edit.")
+        return test_cases
+
+    edited_suites = []
+    for suite_idx, suite in enumerate(test_cases):
+        with st.expander(f"Test Suite for Story {suite.story_id}", expanded=True):
+            edited_test_cases = []
+            for tc_idx, test_case in enumerate(suite.test_cases):
+                with st.container(border=True):
+                    st.markdown(f"**Test Case {tc_idx + 1}**")
+                    st.caption(f"*Test ID:* `{test_case.test_id}` (read-only for traceability)")
+                    st.caption(f"*Story Reference:* `{test_case.story_reference}` (read-only for traceability)")
+
+                    scenario = st.text_area(
+                        "Scenario",
+                        value=test_case.scenario,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_scenario",
+                        height=68,
+                    )
+
+                    preconditions = st.text_area(
+                        "Preconditions",
+                        value=test_case.preconditions,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_preconditions",
+                        height=68,
+                    )
+
+                    steps = st.text_area(
+                        "Steps",
+                        value=test_case.steps,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_steps",
+                        height=68,
+                    )
+
+                    expected_result = st.text_area(
+                        "Expected Result",
+                        value=test_case.expected_result,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_expected_result",
+                        height=68,
+                    )
+
+                    # Priority selector
+                    priority_options = ["High", "Medium", "Low"]
+                    try:
+                        priority_index = priority_options.index(test_case.priority)
+                    except ValueError:
+                        priority_index = 1  # Default to Medium
+
+                    priority = st.selectbox(
+                        "Priority",
+                        options=priority_options,
+                        index=priority_index,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_priority",
+                    )
+
+                    # Test type selector
+                    test_type_options = ["Functional", "Negative", "Edge Case", "Integration", "Security"]
+                    try:
+                        test_type_index = test_type_options.index(test_case.test_type)
+                    except ValueError:
+                        test_type_index = 0  # Default to Functional
+
+                    test_type = st.selectbox(
+                        "Test Type",
+                        options=test_type_options,
+                        index=test_type_index,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_test_type",
+                    )
+
+                    # Create updated test case
+                    updated_test_case = TestCase(
+                        test_id=test_case.test_id,
+                        story_reference=test_case.story_reference,
+                        scenario=scenario,
+                        preconditions=preconditions,
+                        steps=steps,
+                        expected_result=expected_result,
+                        priority=priority,
+                        test_type=test_type,
+                        is_approved=test_case.is_approved  # Preserve approval status
+                    )
+                    edited_test_cases.append(updated_test_case)
+
+            # Create updated suite
+            edited_suite = TestSuite(
+                story_id=suite.story_id,
+                test_cases=edited_test_cases
+            )
+            edited_suites.append(edited_suite)
+
+    return edited_suites
+
+
 def _render_implementation_plan_stage(lifecycle) -> None:
     """
     The implementation plan stage: generate from the approved PRD and architecture, review,
@@ -3530,6 +3728,89 @@ def _render_plan_delivery_status(lifecycle) -> None:
     )
 
 
+def _render_test_cases_stage(lifecycle) -> None:
+    """
+    The test cases stage: generate from the approved implementation plan, review, edit,
+    approve explicitly.
+
+    Blocked safely when the upstream plan is missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent scope.
+    Nothing here writes to Jira or anywhere else -- nothing is marked Done merely
+    because test cases were generated.
+    """
+    plan = lifecycle.implementation_plan
+    if plan is None or getattr(plan, "is_empty", True):
+        st.info(
+            "No implementation plan in this session yet. Open the Implementation Plan "
+            "stage and generate one; the test cases are derived from the approved plan."
+        )
+        return
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.info(
+            "The implementation plan is pending review. Open the Implementation Plan "
+            "stage and approve it to generate test cases from it."
+        )
+        return
+
+    test_cases = _held_test_cases()
+
+    if st.button(
+        "Generate test cases from the approved implementation plan",
+        key="generate_test_cases",
+    ):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(TEST_CASES_APPROVED_SESSION_KEY, None)
+        with st.spinner("Generating test cases from the approved implementation plan..."):
+            try:
+                generated = generate_test_suite(plan, client=CLIENT)
+            except Exception:
+                generated = _fallback_test_suite(plan)
+            if not generated:
+                generated = _fallback_test_suite(plan)
+            test_cases = _persist_test_cases(generated)
+
+    if test_cases is None:
+        st.caption(
+            "Not generated yet. This generates test cases from each story in the "
+            "approved implementation plan, covering functional, negative, edge case, "
+            "integration, and security tests where appropriate."
+        )
+        return
+
+    if not test_cases:
+        st.caption(
+            "No test cases could be derived from the approved implementation plan."
+        )
+        return
+
+    _render_test_case_traceability(test_cases, plan)
+
+    if bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.success("These test cases are approved.")
+        _render_test_case_readonly(test_cases)
+        if st.button("Revoke test cases approval to edit", key="revoke_test_cases_approval"):
+            st.session_state[TEST_CASES_APPROVED_SESSION_KEY] = False
+        return
+
+    st.caption(
+        "Approving records that you reviewed these test cases. Nothing is written to "
+        "Jira or to the plan."
+    )
+    if st.button("Approve test cases", key="approve_test_cases"):
+        st.session_state[TEST_CASES_APPROVED_SESSION_KEY] = True
+        _flash("success", "Test cases approved.")
+        return
+
+    # Edit mode: show editable test cases
+    edited_test_cases = _render_test_case_editor(test_cases)
+    if edited_test_cases is not test_cases:
+        # User made edits, persist them
+        test_cases = _persist_test_cases(edited_test_cases)
+        st.caption("Test cases updated. Review your changes and approve when ready.")
+
+
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
     """
     One stage: its status, and either where it already lives or that it is not built.
@@ -3562,6 +3843,8 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
         _render_architecture_stage(lifecycle)
     elif stage == IMPLEMENTATION_PLAN:
         _render_implementation_plan_stage(lifecycle)
+    elif stage == TEST_CASES:
+        _render_test_cases_stage(lifecycle)
     elif stage == DELIVERY_STATUS:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "
@@ -3600,6 +3883,7 @@ def _render_lifecycle_workspace() -> None:
     prd_data = st.session_state.get(PRD_SESSION_KEY)
     architecture_data = st.session_state.get(ARCHITECTURE_SESSION_KEY)
     plan_data = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    test_cases_data = st.session_state.get(TEST_CASES_SESSION_KEY)
     lifecycle = lifecycle_from(
         brd=brd_data if isinstance(brd_data, BRDData) else None,
         discovery_source=str(st.session_state.get(BRD_SOURCE_SESSION_KEY) or ""),
@@ -3618,9 +3902,10 @@ def _render_lifecycle_workspace() -> None:
         implementation_plan_approved=bool(
             st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)
         ),
+        test_cases=test_cases_data,
+        test_cases_approved=bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)),
         delivery_mapping=st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping")),
     )
-
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):
         st.markdown(
             "{}. **{}** — {}{}".format(

@@ -61,6 +61,7 @@ IMPLEMENTED_STAGES = (
     PRD,
     ARCHITECTURE,
     IMPLEMENTATION_PLAN,
+    TEST_CASES,
     DELIVERY_STATUS,
 )
 
@@ -116,6 +117,8 @@ class ProjectLifecycle:
     prd: Optional[PRDData] = None
     architecture: Optional[ArchitectureData] = None
     implementation_plan: Optional[ImplementationPlan] = None
+    test_cases: object = None
+    test_cases_approved: bool = False
     stages: dict = field(default_factory=dict)
 
     def state(self, stage: str) -> StageState:
@@ -273,6 +276,35 @@ def _implementation_plan_state(
     return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
 
 
+def _test_cases_state(test_cases, test_cases_approved: bool):
+    """
+    The test cases stage's ``(status, detail)``.
+
+    The gate is the *approved* implementation plan: test cases derived against work
+    nobody signed off would have to be regenerated. As with every stage above,
+    approval is only ever reported when the approval control set it.
+    """
+    if test_cases is None or not isinstance(test_cases, (list, tuple)):
+        return (
+            NOT_STARTED,
+            "No test cases have been generated yet. Generate them from the approved "
+            "implementation plan.",
+        )
+    test_suites = tuple(test_cases)
+    if not test_suites or all(not getattr(suite, "test_cases", []) for suite in test_suites):
+        return (
+            NOT_STARTED,
+            "The approved implementation plan is ready. Generate test cases from it.",
+        )
+
+    total_tests = sum(len(suite.test_cases) for suite in test_suites)
+    suite_count = len(test_suites)
+    coverage = "{} test case(s) across {} story/stories".format(total_tests, suite_count)
+    if test_cases_approved:
+        return (APPROVED, coverage + ". Approved.")
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve below.")
+
+
 def lifecycle_from(
     brd: Optional[BRDData] = None,
     discovery_source: str = "",
@@ -285,6 +317,8 @@ def lifecycle_from(
     architecture_approved: bool = False,
     implementation_plan: Optional[ImplementationPlan] = None,
     implementation_plan_approved: bool = False,
+    test_cases=None,
+    test_cases_approved: bool = False,
     delivery_mapping=None,
 ) -> ProjectLifecycle:
     """
@@ -302,6 +336,8 @@ def lifecycle_from(
     lifecycle's own ``implementation_plan`` is a different artifact entirely: it is the
     engineering structure the delivery stage later turns into issues.
 
+    ``test_cases`` is the suite of generated test cases for the implementation plan.
+
     ``delivery_mapping`` is the record of which approved implementation-plan items were
     created as which Jira issues, read the same duck-typed way. It reports *creation*
     evidence and never a Jira workflow status: nothing here reads an issue back, and
@@ -314,6 +350,8 @@ def lifecycle_from(
         prd=prd,
         architecture=architecture,
         implementation_plan=implementation_plan,
+        test_cases=test_cases,
+        test_cases_approved=test_cases_approved,
     )
 
     if brd is None:
@@ -359,7 +397,12 @@ def lifecycle_from(
             implementation_plan_approved,
         )
     )
-    for stage in (SPRINT_PLAN, TEST_CASES, TEST_EXECUTION):
+    test_cases_ready = implementation_plan_approved and architecture_ready
+    lifecycle.record(
+        TEST_CASES,
+        *_test_cases_state(test_cases if test_cases_ready else None, test_cases_approved and test_cases_ready),
+    )
+    for stage in (SPRINT_PLAN, TEST_EXECUTION):
         lifecycle.record(stage, NOT_STARTED, NOT_IMPLEMENTED_DETAIL)
 
     succeeded = tuple(
