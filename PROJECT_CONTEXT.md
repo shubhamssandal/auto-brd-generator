@@ -350,8 +350,12 @@ Explicit PRD approval → Architecture → review/edit → approval
 Explicit architecture approval → Implementation Plan
 (epics → stories → technical tasks) → review/edit → approval
         ↓
-Later stages (Jira delivery of the plan, sprint planning, test
-cases, test execution, coding agent) — not implemented yet
+Explicit plan approval → mapped onto the selected Jira project's
+own issue types → preview → explicit confirmation → Epics /
+Stories / Tasks / Subtasks → plan item → issue key mapping
+        ↓
+Later stages (sprint planning, test cases, test execution,
+coding agent) — not implemented yet
 ```
 
 ---
@@ -393,8 +397,17 @@ component in a generic list has its layer inferred, and the inference is recorde
 The implementation plan is deliberately not tracker-shaped. `jira_models.PlannedIssue` is
 bound to a selected Jira project's issue types, hierarchy levels and required fields, so it
 cannot exist at this stage of the lifecycle. `implementation_plan_models.ImplementationPlan`
-is the tracker-agnostic engineering structure; a later stage maps one onto the other. The
-two models are separate on purpose and must not be merged.
+is the tracker-agnostic engineering structure; `implementation_plan_jira.py` maps one onto
+the other when a reviewer confirms a delivery. The two models are separate on purpose and
+must not be merged.
+
+Delivery into a tracker is one-way and keyed by the plan's own ids. The mapping
+`plan item id → Jira issue key` is recorded as issues are created, which is both the
+traceability record and the reason a retry cannot duplicate anything: an item that already
+has a key is never sent again. A hierarchy the target project cannot represent is reported
+and left uncreated rather than flattened onto the wrong parent. Nothing Jira reports may
+change the plan, the architecture, the PRD or the BRD, and no per-issue read exists — a
+workflow status change is an implementation-status change, never a requirement change.
 
 A model proposal is repaired deterministically rather than re-prompted. Unknown upstream
 ids, references to an epic that is not in the plan, self-dependencies, dependencies that

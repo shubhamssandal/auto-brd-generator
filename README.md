@@ -4,7 +4,7 @@ This project is a Streamlit web application for an AI-assisted software delivery
 
 > **Discovery → BRD → PRD → Architecture → Implementation Plan → Sprint Planning → Test Cases → Test Execution → Jira / Delivery Status**
 
-Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), derives a Product Requirements Document (PRD) from an approved BRD, derives a technical architecture from an approved PRD, decomposes the approved PRD and architecture into an implementation plan of epics, stories and technical tasks, and optionally delivers the reviewed requirements into Jira as traceable issues. The remaining stages — sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [BRD to PRD](#brd-to-prd), [PRD to Architecture](#prd-to-architecture), [Architecture to Implementation Plan](#architecture-to-implementation-plan) and [What Has Actually Been Verified](#what-has-actually-been-verified) for exactly what is built and what is planned.
+Today it converts raw, unstructured meeting notes into a draft Business Requirements Document (BRD), derives a Product Requirements Document (PRD) from an approved BRD, derives a technical architecture from an approved PRD, decomposes the approved PRD and architecture into an implementation plan of epics, stories and technical tasks, and delivers either the reviewed requirements or an approved implementation plan into Jira as traceable issues. The remaining stages — sprint planning, test cases and test execution — are **navigable in the UI but not implemented yet**; each one reports its own state rather than offering a control that does nothing. See [BRD to PRD](#brd-to-prd), [PRD to Architecture](#prd-to-architecture), [Architecture to Implementation Plan](#architecture-to-implementation-plan), [Implementation Plan to Jira](#implementation-plan-to-jira) and [What Has Actually Been Verified](#what-has-actually-been-verified) for exactly what is built and what is planned.
 
 It is designed as a portfolio piece to demonstrate skills in business analysis, requirements engineering, and the responsible application of Large Language Models (LLMs).
 
@@ -61,9 +61,14 @@ All four ingestion sources normalize into one `NormalizedTranscript` and then fl
         Optional Jira delivery  (OAuth 2.0 3LO + Atlassian REST)
         site → project → required fields → work plan → review
                  → explicit confirmation → issue creation
+                                ▼
+        Approved implementation plan → mapped onto that project's
+        own issue types → preview → explicit confirmation
+                 → Epics / Stories / Tasks / Subtasks
+                 → plan item → issue key mapping
 ```
 
-Everything after the Markdown export is optional. A BRD is complete without it, and nothing is written to Jira until a reviewer confirms. The Jira branch is a *parallel* path, not the continuation of the implementation plan: it maps the reviewed **BRD** onto issues. Approving an implementation plan creates nothing in Jira — mapping the plan's epics, stories and tasks onto a tracker is the next stage of work and is not built yet.
+Everything after the Markdown export is optional. A BRD is complete without it, and nothing is written to Jira until a reviewer confirms. The Jira panel now carries two independent deliveries into the same project: the reviewed **BRD** as issues, and an **approved implementation plan** as an Epic → Story → Task hierarchy. Neither is a prerequisite of the other, and no Jira read of any kind changes the BRD, the PRD, the architecture or the plan — the trail runs one way.
 
 ### Module map
 
@@ -78,6 +83,7 @@ Everything after the Markdown export is optional. A BRD is complete without it, 
 | `architecture_generator.py`   | Approved PRD → architecture prompt, untrusted-response validation, deterministic baseline fallback                          |
 | `implementation_plan_models.py`    | Implementation plan dataclasses: `Epic`, `Story`, `TechnicalTask`, `ImplementationPlan`, priority vocabulary, PRD-feature and architecture-component traceability |
 | `implementation_plan_generator.py` | Approved PRD + architecture → plan prompt, untrusted-response validation, deterministic repair (unknown ids, dependency cycles), baseline fallback |
+| `implementation_plan_jira.py`      | Approved plan → one project's own issue types, hierarchy-shortfall reporting, the stable plan item → issue key mapping, creation progress |
 | `model_output.py`             | Shared reader for untrusted model output: JSON extraction, field aliases, safe error messages                              |
 | `transcript_processor.py`     | Manual-paste and `.txt` upload normalization                                                                              |
 | `providers/base.py`           | `TranscriptProvider` contract and the provider error hierarchy                                                            |
@@ -211,10 +217,23 @@ An **approved** architecture, standing on an approved PRD and BRD, can be decomp
 - **A proposal is repaired deterministically, never re-prompted.** Feature and component ids the upstream artifacts do not hold are removed; stories naming an unknown epic are kept but left ungrouped; self-dependencies and dependencies matching no story are dropped; a dependency cycle loses only its closing link, so the work stays startable; priorities outside `Highest/High/Medium/Low/Lowest` are set to `Medium`. Every repair is listed in the plan's notes, so a reviewer reads what changed instead of trusting the result.
 - **Readiness is reported, not faked.** A story missing a description, acceptance criteria, technical tasks, a component or a feature is flagged with the specific gaps rather than having them auto-filled — those are judgement calls a product owner makes.
 - **Failure degrades instead of inventing.** With no model configured, an unreachable provider, a response that cannot be read, or a response whose every story was untraceable, the stage falls back to a deterministic skeleton — one epic and story per PRD feature, one task per realising component, borrowing the PRD's own acceptance criteria and proposing no sequencing it cannot justify — and says why. Provider failures report the exception type only, never the client's message.
-- **Nothing is written to Jira.** The plan is tracker-agnostic by design: it exists before any tracker is chosen, so it does not carry Jira issue types, hierarchy levels or required fields. Mapping an approved plan onto a tracker is a later stage.
+- **The plan itself is tracker-agnostic.** It exists before any tracker is chosen, so it carries no Jira issue types, hierarchy levels or required fields. Approving it writes nothing anywhere; delivering it into a project is the separate, explicitly confirmed step described in [Implementation Plan to Jira](#implementation-plan-to-jira).
 - **A new architecture invalidates the plan built against the old one.** Regenerating the PRD or the architecture clears the plan, its approval and the review editor's state.
 
-## Optional Jira Delivery
+## Implementation Plan to Jira
+
+An **approved** implementation plan can be delivered into the selected Jira project as Step 6 of the Jira panel. It is the only stage that writes work items to a tracker, and it is built so that a retry after something goes wrong finishes the job instead of doubling it.
+
+- **Approval is the gate.** A plan that is merely generated creates nothing: the panel says so and offers no button. Nothing about the plan, the architecture, the PRD or the BRD is ever modified by anything Jira reports — the trail runs one way, and no BRD synchronization exists in either direction.
+- **The project's hierarchy decides the issue types.** `implementation_plan_jira.map_plan_to_work_plan` reads the rungs Jira actually reported for that project and places an epic on the top rung, a story on the next and a technical task on the one below. A project whose rungs are named `Initiative / Feature / Work Item` is served in its own vocabulary, and the substitution is stated in a note rather than being silent.
+- **A hierarchy Jira cannot represent is reported, not faked.** If the project has two rungs and the plan needs three, the items that do not fit are shown **unselected**, with a note naming the shortfall, and nothing is flattened onto the wrong parent or promoted into the wrong type. A story whose epic could not be created is created without a parent and keeps its plan epic id in the description, because the work is real even when its container is not creatable.
+- **Plan ids and upstream references travel with the issue.** Each issue's description carries its own plan id, the PRD feature ids and architecture component ids it traces to, its dependencies, priority and estimate, and the titles of the PRD and architecture it descends from — so a reviewer reading the issue in Jira can get back to the artifact it came from.
+- **The mapping is stable and idempotent.** A `DeliveryMapping` records plan item id → Jira issue key for every item that was actually created. Re-rendering the panel, editing the plan or running again does not move a key. Because Jira's create endpoint has no idempotency key, a repeat is prevented *before* the request: an item that already has a key is skipped, while its key is still used as the parent of a child created now. A failure is deliberately **not** recorded as a link, so the item stays pending and a retry creates it.
+- **A partial failure is recoverable.** A run stops at the first failure rather than orphaning children, folds its successes into the mapping, and shows what is left. The next run creates only the pending items.
+- **Writing needs two explicit confirmations.** A request button, then a warning naming the count and the project, then "Yes — create them now". An in-flight guard stops a rerun from starting a second run, and a session authorized without `write:jira-work` is told before anything is attempted.
+- **Status means creation evidence.** The delivery panel and the "Jira / Delivery Status" stage report what this app recorded when it created each issue, with a browse link per issue. This app has **no** read-issue endpoint and does not poll an issue's workflow state — the per-issue read that once existed was removed with the requirement-drift feature it served, and reintroducing it is out of scope.
+
+## Optional Jira Delivery (the BRD path)
 
 A reviewed BRD can be turned into Jira issues without leaving the app. The panel appears under the BRD and takes five explicit steps: choose a Jira site, choose a project, check what that project's issue types actually require, generate a work plan, and create the selected issues.
 
@@ -300,6 +319,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | `test_prd.py`                   | Approved BRD → PRD generation, the approval gate, optional refinement transcript, BRD → PRD traceability, review/edit persistence, explicit approval, provider and malformed-response fallbacks                                                    |
 | `test_architecture.py`          | Approved PRD → architecture generation, the PRD gate, backend/web/mobile coverage, optional architecture discussion, PRD → architecture traceability, layer resolution, review/edit persistence, explicit approval, provider and malformed-response fallbacks |
 | `test_implementation_plan.py`   | Approved PRD + architecture → implementation plan, both gates, epic/story/task hierarchy and work types, asymmetric traceability (untraceable story dropped, componentless task kept), deterministic repair of unknown ids, self- and dangling dependencies, dependency cycles and priorities, readiness gaps, dependency ordering, baseline fallback paths, domain independence, session cascade |
+| `test_implementation_plan_jira.py` | Approval gate, mapping onto the project's own issue types and hierarchy, unrepresentable-hierarchy reporting, preserved Epic → Story → Task parents, plan id and PRD/architecture references on each issue, the stable plan id → issue key mapping, idempotent retry and partial-failure recovery through the real creation loop, the two-step confirmation gate, write-scope refusal, status read from creation evidence, no read-issue endpoint, BRD-path regression, domain independence |
 
 ## What Has Actually Been Verified
 
@@ -315,6 +335,7 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 | Approved BRD → PRD, traceability, review/edit and explicit approval   | Covered by `test_prd.py`; the model is injected as a callable, so no PRD test reaches a provider                                                                                    |
 | Approved PRD → Architecture, traceability, review/edit and approval   | Covered by `test_architecture.py`; the model is injected as a callable, so no architecture test reaches a provider                                                                  |
 | Approved architecture → Implementation Plan, hierarchy, repair and approval | Covered by `test_implementation_plan.py`; the model is injected as a callable, so no plan test reaches a provider, and no plan test writes to Jira                             |
+| Approved Implementation Plan → Jira issues, stable mapping, idempotent retry | Covered by `test_implementation_plan_jira.py` against a recording service, so no test reaches Atlassian. Delivery status is read from creation records; **no Jira workflow-status polling exists** |
 | **Live Google Meet transcript retrieval**                             | **Not verified.** Requires real `GOOGLE_WORKSPACE_*` credentials and a Google Workspace account with Meet transcription enabled.                                                   |
 | **Live Microsoft Teams transcript retrieval**                         | **Not verified.** Requires a real Entra ID app registration, `AZURE_*` credentials, and tenant admin consent.                                                                      |
 | **Live Jira issue creation**                                          | **Not verified in this repository.** All Jira tests run against mocked Atlassian responses; a real end-to-end run needs a Jira Cloud site and an app with the five scopes granted. |
@@ -329,6 +350,8 @@ A reviewed BRD can be turned into Jira issues without leaving the app. The panel
 - **Verbatim evidence check.** Validation uses exact substring containment, so a paraphrased quote is demoted to an Assumption even when the underlying point is real.
 - **Stateless operation.** Nothing is persisted between sessions; tokens vanish when the session ends and BRD drafts are downloaded as Markdown.
 - **A stale plan is tolerated, not corrected.** After a BRD is regenerated, a previously generated work plan still restates the older wording until it is regenerated.
-- **The implementation plan stops at approval.** Nothing consumes an approved plan yet — sprint planning, test cases and test execution are not implemented, and the plan is not mapped onto Jira issues — and none of the PRD, the architecture or the plan has a Markdown export of its own, so all three live only in the session.
+- **The lifecycle stops at Jira delivery.** Nothing consumes the created issues yet — sprint planning, test cases and test execution are not implemented — and none of the PRD, the architecture or the plan has a Markdown export of its own, so all three live only in the session.
+- **Delivery status is creation evidence, not Jira workflow status.** The app records what it created and links to each issue, but it never reads an issue back, so a `To Do → In Progress → Done` transition in Jira is invisible here. That is deliberate: a per-issue read is what the removed requirement-drift feature used, and reintroducing it would rebuild a Jira → BRD path the product direction forbids.
+- **A delivery mapping belongs to one project.** Its keys mean nothing elsewhere, so choosing a different project or disconnecting drops it along with the rest of that project's state, and the plan would be delivered afresh.
 - **OAuth state does not survive a restart** unless `OAUTH_STATE_SECRET` is set, because the signing key is otherwise generated per process. An in-flight sign-in must be restarted.
 - **Prompt sensitivity.** Output quality is bounded by the clarity and completeness of the source notes.

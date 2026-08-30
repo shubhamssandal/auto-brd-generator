@@ -48,6 +48,14 @@ from lifecycle_models import (
     lifecycle_from,
 )
 from jira_planner import action_item_index, generate_work_plan
+from implementation_plan_jira import (
+    DeliveryMapping,
+    delivery_progress,
+    known_issue_keys,
+    map_plan_to_work_plan,
+    pending_plan_keys,
+    record_created_issues,
+)
 from prd_generator import generate_prd
 from prd_models import PRDData
 from jira_processor import (
@@ -637,6 +645,17 @@ _JIRA_PROJECT_SUFFIXES = (
     "created",
     "creating",
     "confirm_create",
+    # The stable plan item -> issue key mapping an approved implementation plan
+    # produced in this project, the last run's per-item outcomes, and the guards for
+    # that one write. A mapping is only meaningful against the project its keys live
+    # in, so choosing a different project or disconnecting drops it with everything
+    # else here. The mapped proposal itself is not stored: it is recomputed from the
+    # approved plan and this project's metadata, so the preview cannot drift from the
+    # plan the reviewer approved.
+    "delivery_mapping",
+    "delivery_results",
+    "delivery_creating",
+    "delivery_confirm",
 )
 
 # The four evidence sources this app ingests, offered by the BRD generator below.
@@ -1437,6 +1456,7 @@ def _render_jira_projects_panel(service, tokens: TokenSet, site) -> None:
     _render_jira_project_metadata(metadata)
     _render_jira_work_plan_panel(project, metadata, wanted)
     _render_jira_creation_panel(service, tokens, site, project, metadata)
+    _render_plan_delivery_panel(service, tokens, site, project, metadata)
 
 
 def _render_jira_project_metadata(metadata) -> None:
@@ -1871,7 +1891,7 @@ def _result_for(issue, **outcome) -> CreatedIssue:
     )
 
 
-def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
+def _create_selected_issues(service, tokens, cloud_id, project, plan, known_keys=None) -> tuple:
     """
     Create the selected issues, parents first, and report each outcome.
 
@@ -1879,12 +1899,20 @@ def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
     missing, and a run that half-built a hierarchy is harder to clean up than one that
     stopped where it broke.
 
+    ``known_keys`` maps a plan key to the Jira issue key it was *already* created as in
+    an earlier run. Such an item is not sent again -- its key is simply remembered so a
+    child created now is parented onto the real issue. This is what makes a retry after
+    a partial failure safe: Jira's create endpoint has no idempotency key, so a repeat
+    has to be prevented before the request rather than detected after it. Nothing passes
+    this argument for the BRD-derived plan, which has no cross-run mapping to consult.
+
     The token is refreshed *before* the run rather than in reaction to a 401, so no
     create is ever re-sent: ``JiraService.create_issue`` raises an authentication error
     on 401 instead of the expiry error ``call_with_refresh`` would retry.
     """
     created: list = []
-    keys_by_plan_key: dict = {}
+    keys_by_plan_key: dict = dict(known_keys or {})
+    already_created = set(keys_by_plan_key)
 
     if tokens.is_expired() and tokens.can_refresh():
         try:
@@ -1895,6 +1923,10 @@ def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
             return ()
 
     for issue in creation_order(plan):
+        if issue.plan_key in already_created:
+            # Already in Jira. Skipped rather than re-sent, and no result is recorded:
+            # the mapping already holds the outcome this item had.
+            continue
         parent_key = keys_by_plan_key.get(issue.parent_plan_key, "")
         payload = issue_creation_payload(issue, project.api_identifier, parent_key)
         try:
@@ -2045,6 +2077,205 @@ def _render_jira_creation_panel(service, tokens, site, project, metadata) -> Non
     if results:
         st.session_state[created_key] = results
     _render_created_results(results or (), site.url)
+
+
+def _approved_implementation_plan() -> tuple:
+    """
+    The approved implementation plan, or ``(None, why not)``.
+
+    The delivery gate. Mapping a draft plan onto issues would create work from
+    something nobody signed off, so an unapproved plan is refused here rather than
+    warned about later.
+    """
+    plan = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    if not isinstance(plan, ImplementationPlan) or plan.is_empty:
+        return None, (
+            "No implementation plan is held yet. Generate one in the Implementation Plan "
+            "stage — it needs an approved PRD and an approved architecture first."
+        )
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        return None, (
+            "This implementation plan is not approved yet. Review and approve it in the "
+            "Implementation Plan stage; nothing is created in Jira from a draft plan."
+        )
+    return plan, ""
+
+
+def _render_delivery_mapping(mapping, site_url: str = "") -> None:
+    """
+    The plan item → Jira issue mapping, which is the delivery record.
+
+    Rendered from the stored mapping rather than from a run, so it survives the reruns
+    that follow creation and stays readable after a partial failure.
+    """
+    if mapping is None or mapping.is_empty:
+        return
+    st.markdown("**Delivery mapping — implementation plan item → Jira issue**")
+    for link in mapping.links:
+        url = issue_browse_url(site_url, link.issue_key) if site_url else ""
+        shown = "[{}]({})".format(link.issue_key, url) if url else "`{}`".format(link.issue_key)
+        trace = []
+        if link.feature_ids:
+            trace.append("PRD {}".format(", ".join(link.feature_ids)))
+        if link.component_ids:
+            trace.append("architecture {}".format(", ".join(link.component_ids)))
+        st.write(
+            "- `{}` → {}{} — {}{}".format(
+                link.plan_item_id,
+                shown,
+                " ({})".format(link.issue_type_name) if link.issue_type_name else "",
+                link.summary or "",
+                " — traces to {}".format(" and ".join(trace)) if trace else "",
+            )
+        )
+
+
+def _render_plan_delivery_panel(service, tokens, site, project, metadata) -> None:
+    """
+    Step 6: an approved implementation plan onto this project's issues.
+
+    Four gates, in this order: the plan must be approved, the mapping must be valid
+    against this project's own hierarchy, the session must hold the write scope, and the
+    reviewer must confirm twice. Only the last branch writes, and only for plan items
+    that have no Jira issue yet — so a retry after a partial failure finishes the run
+    instead of duplicating what already exists.
+    """
+    st.markdown("**Step 6 — deliver the approved implementation plan**")
+
+    plan, blocked = _approved_implementation_plan()
+    if plan is None:
+        st.caption(blocked)
+        return
+
+    mapping_key = _skey(JIRA_STATE_NAME, "delivery_mapping")
+    results_key = _skey(JIRA_STATE_NAME, "delivery_results")
+    creating_key = _skey(JIRA_STATE_NAME, "delivery_creating")
+    confirm_key = _skey(JIRA_STATE_NAME, "delivery_confirm")
+
+    # Recomputed rather than cached, so what is previewed and created is always the
+    # plan that is currently approved against this project's current metadata.
+    work_plan = map_plan_to_work_plan(plan, metadata, project)
+    mapping = st.session_state.get(mapping_key)
+    if not isinstance(mapping, DeliveryMapping):
+        mapping = DeliveryMapping(
+            project_identifier=project.api_identifier,
+            project_label=project.display_label,
+            site_url=site.url,
+        )
+    results = st.session_state.get(results_key) or ()
+
+    for note in work_plan.notes:
+        st.info(note)
+
+    if work_plan.is_empty:
+        return
+
+    progress = delivery_progress(work_plan, mapping, results)
+    st.write(
+        "**{}** of **{}** mapped plan item(s) exist in **{}**.{}".format(
+            progress.created,
+            progress.total,
+            project.display_label,
+            " {} item(s) cannot be created in this project.".format(progress.excluded)
+            if progress.excluded
+            else "",
+        )
+    )
+    _render_delivery_mapping(mapping, site.url)
+    if results:
+        _render_created_results(results, site.url)
+
+    if progress.is_complete:
+        st.success(
+            "Every mapped plan item has a Jira issue. Delivery status is read from these "
+            "creation records; this app does not poll Jira for an issue's workflow state."
+        )
+        return
+
+    problems = validate_work_plan(work_plan, metadata, project)
+    if problems:
+        st.warning(
+            "This plan cannot be created in {} yet:".format(project.display_label)
+        )
+        for problem in problems:
+            st.write("- {}".format(problem))
+        return
+
+    granted = tokens.public_summary().get("scopes")
+    if granted and service.WRITE_SCOPE not in granted:
+        st.warning(
+            "This Jira session was authorized without `{}`, so it cannot create issues. "
+            "Disconnect and connect again to grant it. Nothing has been created.".format(
+                service.WRITE_SCOPE
+            )
+        )
+        return
+
+    pending = pending_plan_keys(work_plan, mapping)
+    if not pending:
+        st.caption("Nothing is left to create from this plan.")
+        return
+
+    verb = "Create" if not mapping.created_count else "Create the remaining"
+    st.caption(
+        "{} item(s) would be created: {}. Parents are created before the children that "
+        "name them, and an item that already has a Jira issue is skipped rather than "
+        "created again.".format(
+            len(pending), ", ".join("`{}`".format(key) for key in pending[:12])
+            + (", …" if len(pending) > 12 else "")
+        )
+    )
+
+    if not st.session_state.get(confirm_key):
+        if st.button(
+            "{} {} Issue(s) in Jira".format(verb, len(pending)), key="request_plan_delivery"
+        ):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning(
+        "Confirm: create {} issue(s) in {} from the approved implementation plan. This "
+        "cannot be undone from this app.".format(len(pending), project.display_label)
+    )
+    confirmed = st.button("Yes — create them now", key="confirm_plan_delivery")
+    if st.button("Cancel", key="cancel_plan_delivery"):
+        st.session_state.pop(confirm_key, None)
+        st.rerun()
+        return
+    if not confirmed:
+        return
+
+    # Stored before the first request and cleared only after the run, so a rerun that
+    # arrives mid-run finds it set and cannot start a second one.
+    if st.session_state.get(creating_key):
+        st.info("A creation run is already in progress.")
+        return
+    st.session_state[creating_key] = True
+    try:
+        with st.spinner("Creating {} issue(s) in Jira...".format(len(pending))):
+            run = _create_selected_issues(
+                service,
+                tokens,
+                site.id,
+                project,
+                work_plan,
+                known_keys=known_issue_keys(mapping),
+            )
+    finally:
+        st.session_state.pop(creating_key, None)
+        st.session_state.pop(confirm_key, None)
+
+    # The mapping is folded in before anything is rendered, so even a run that failed
+    # part way through leaves the successes recorded and un-creatable a second time.
+    st.session_state[mapping_key] = record_created_issues(mapping, run, work_plan, plan)
+    st.session_state[results_key] = run
+    _render_created_results(run or (), site.url)
+    if any(not record.succeeded for record in run or ()):
+        st.info(
+            "The issues above that were created are recorded in the delivery mapping and "
+            "will not be created again. Use this step once more to create what is left."
+        )
 
 
 def _render_jira_section() -> None:
@@ -3267,6 +3498,38 @@ def _render_implementation_plan_stage(lifecycle) -> None:
         _flash("success", "Implementation plan approved.")
 
 
+def _render_plan_delivery_status(lifecycle) -> None:
+    """
+    What the approved implementation plan became in Jira, read-only.
+
+    Reads session state and nothing else: no token, no request, so opening this stage
+    cannot create, change or re-read anything. Status here means *delivery creation*
+    status, which is a fact this app recorded when it created the issues. It is not an
+    issue's Jira workflow status: this app has no read-issue endpoint, and the per-issue
+    read that once existed was removed along with the requirement-drift feature it
+    served. Saying "In Progress" would otherwise imply a workflow read that never
+    happened.
+    """
+    mapping = st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping"))
+    if not isinstance(mapping, DeliveryMapping) or mapping.is_empty:
+        st.caption(
+            "No implementation-plan item has been created in Jira yet, so there is no "
+            "delivery mapping to show."
+        )
+        return
+
+    st.markdown(
+        "**{}** implementation-plan item(s) created in **{}**.".format(
+            mapping.created_count, mapping.project_label or mapping.project_identifier
+        )
+    )
+    _render_delivery_mapping(mapping, mapping.site_url)
+    st.caption(
+        "Recorded when each issue was created. Nothing in Jira changes the plan, the "
+        "architecture, the PRD or the BRD — the trail runs one way."
+    )
+
+
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
     """
     One stage: its status, and either where it already lives or that it is not built.
@@ -3303,8 +3566,11 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "
             "issue creation are in the Jira section above, along with the created issue "
-            "keys and the requirements each one came from."
+            "keys and the requirements each one came from. Step 6 there maps the approved "
+            "implementation plan onto this project's own issue hierarchy and records the "
+            "plan item → issue key mapping."
         )
+        _render_plan_delivery_status(lifecycle)
     else:
         st.info(
             "{} is not implemented yet. Nothing here generates an artifact.".format(
@@ -3352,6 +3618,7 @@ def _render_lifecycle_workspace() -> None:
         implementation_plan_approved=bool(
             st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)
         ),
+        delivery_mapping=st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping")),
     )
 
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):

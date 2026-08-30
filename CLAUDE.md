@@ -24,10 +24,10 @@ This document is the **target specification**. Stages it describes with "should"
 | BRD → PRD | Implemented (`prd_generator.py`, review/edit, explicit approval) |
 | PRD → Architecture | Implemented (`architecture_generator.py`, review/edit, explicit approval) |
 | Architecture → Implementation Plan | Implemented (`implementation_plan_generator.py`, epic/story/task hierarchy, review/edit, explicit approval; writes nothing to Jira) |
-| Implementation Plan → Jira | **Not implemented.** The existing Jira layer maps the *BRD* onto issues; mapping an approved plan is the next stage of work. |
+| Implementation Plan → Jira | Implemented (`implementation_plan_jira.py`, mapping onto the selected project's own issue types, preview, explicit confirmation, idempotent creation, stable plan id → issue key mapping) |
 | Sprint Planning | **Not implemented.** |
 | Story → Test Cases | **Not implemented.** |
-| Test Execution / Delivery Tracking | Partially implemented: Jira creation results and execution status are read and displayed; test-case execution recording is not built. |
+| Test Execution / Delivery Tracking | Partially implemented: Jira creation results and the plan → issue delivery mapping are recorded and displayed. No issue is read back from Jira, so no workflow status is polled, and test-case execution recording is not built. |
 | AI Coding Agent | **Not implemented.** |
 | Sprint Completion / Next Sprint | **Not implemented.** |
 

@@ -285,6 +285,7 @@ def lifecycle_from(
     architecture_approved: bool = False,
     implementation_plan: Optional[ImplementationPlan] = None,
     implementation_plan_approved: bool = False,
+    delivery_mapping=None,
 ) -> ProjectLifecycle:
     """
     Derive the current lifecycle from the artifacts this session actually holds.
@@ -300,6 +301,11 @@ def lifecycle_from(
     creation run, both read positionally so this module stays independent of Jira. The
     lifecycle's own ``implementation_plan`` is a different artifact entirely: it is the
     engineering structure the delivery stage later turns into issues.
+
+    ``delivery_mapping`` is the record of which approved implementation-plan items were
+    created as which Jira issues, read the same duck-typed way. It reports *creation*
+    evidence and never a Jira workflow status: nothing here reads an issue back, and
+    nothing a tracker says is allowed to change an artifact upstream of it.
     """
     lifecycle = ProjectLifecycle(
         project_title=(brd.project_title if brd is not None else ""),
@@ -359,7 +365,24 @@ def lifecycle_from(
     succeeded = tuple(
         record for record in created or () if getattr(record, "succeeded", False)
     )
-    if succeeded:
+    delivered = int(getattr(delivery_mapping, "created_count", 0) or 0)
+    if succeeded and delivered:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            IN_PROGRESS,
+            "{} issue(s) created in Jira from the reviewed work plan, and {} approved "
+            "implementation-plan item(s) created as issues.".format(
+                len(succeeded), delivered
+            ),
+        )
+    elif delivered:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            IN_PROGRESS,
+            "{} approved implementation-plan item(s) created as Jira issues. Recorded "
+            "when they were created; no Jira workflow status is read.".format(delivered),
+        )
+    elif succeeded:
         lifecycle.record(
             DELIVERY_STATUS,
             IN_PROGRESS,
