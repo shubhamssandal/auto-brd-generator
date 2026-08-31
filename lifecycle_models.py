@@ -28,6 +28,14 @@ from brd_models import BRDData
 from implementation_plan_models import ImplementationPlan
 from prd_models import PRDData
 
+# Import test execution constants
+from test_case_models import (
+    TEST_EXECUTION_NOT_RUN,
+    TEST_EXECUTION_PASS,
+    TEST_EXECUTION_FAIL,
+    TEST_EXECUTION_BLOCKED,
+)
+
 # --- Stages ---------------------------------------------------------------
 
 DISCOVERY_BRD = "discovery_brd"
@@ -62,6 +70,7 @@ IMPLEMENTED_STAGES = (
     ARCHITECTURE,
     IMPLEMENTATION_PLAN,
     TEST_CASES,
+    TEST_EXECUTION,
     DELIVERY_STATUS,
 )
 
@@ -305,6 +314,74 @@ def _test_cases_state(test_cases, test_cases_approved: bool):
     return (PENDING_REVIEW, coverage + ". Review, edit and approve below.")
 
 
+def _test_execution_state(test_cases) -> tuple:
+    """
+    The test execution stage's ``(status, detail)``.
+
+    The gate is the *approved* test cases: executing tests against unapproved test
+    cases would be meaningless. We derive status from the actual execution results
+    stored on the test cases themselves.
+    """
+    if test_cases is None or not isinstance(test_cases, (list, tuple)):
+        return (
+            NOT_STARTED,
+            "No test cases have been generated yet. Generate test cases first.",
+        )
+
+    # Flatten all test cases from all suites
+    all_test_cases = []
+    for suite in test_cases:
+        if hasattr(suite, 'test_cases'):
+            all_test_cases.extend(suite.test_cases)
+        elif isinstance(suite, (list, tuple)):
+            all_test_cases.extend(suite)
+
+    if not all_test_cases:
+        return (
+            NOT_STARTED,
+            "No test cases available for execution.",
+        )
+
+    # Count execution states
+    not_run_count = 0
+    pass_count = 0
+    fail_count = 0
+    blocked_count = 0
+
+    for tc in all_test_cases:
+        status = getattr(tc, 'execution_status', TEST_EXECUTION_NOT_RUN)
+        if status == TEST_EXECUTION_NOT_RUN:
+            not_run_count += 1
+        elif status == TEST_EXECUTION_PASS:
+            pass_count += 1
+        elif status == TEST_EXECUTION_FAIL:
+            fail_count += 1
+        elif status == TEST_EXECUTION_BLOCKED:
+            blocked_count += 1
+
+    total = len(all_test_cases)
+
+    # Determine overall status
+    if fail_count > 0:
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    elif blocked_count > 0:
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    elif not_run_count == 0 and pass_count > 0:
+        # All test cases have been run and passed
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (COMPLETED, status_detail)
+    elif pass_count > 0:
+        # Some test cases have been run and passed
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    else:
+        # No test cases have been run yet
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (PENDING_REVIEW, status_detail)
+
+
 def lifecycle_from(
     brd: Optional[BRDData] = None,
     discovery_source: str = "",
@@ -402,8 +479,15 @@ def lifecycle_from(
         TEST_CASES,
         *_test_cases_state(test_cases if test_cases_ready else None, test_cases_approved and test_cases_ready),
     )
-    for stage in (SPRINT_PLAN, TEST_EXECUTION):
-        lifecycle.record(stage, NOT_STARTED, NOT_IMPLEMENTED_DETAIL)
+    lifecycle.record(
+        SPRINT_PLAN,
+        NOT_STARTED,
+        NOT_IMPLEMENTED_DETAIL
+    )
+    lifecycle.record(
+        TEST_EXECUTION,
+        *_test_execution_state(test_cases if test_cases_ready else None)
+    )
 
     succeeded = tuple(
         record for record in created or () if getattr(record, "succeeded", False)

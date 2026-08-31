@@ -60,7 +60,7 @@ from implementation_plan_jira import (
 from prd_generator import generate_prd
 from prd_models import PRDData
 from test_case_generator import generate_test_suite, _fallback_test_suite
-from test_case_models import TestCase, TestSuite
+from test_case_models import TestCase, TestSuite, TEST_EXECUTION_NOT_RUN, TEST_EXECUTION_PASS, TEST_EXECUTION_FAIL, TEST_EXECUTION_BLOCKED
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -720,6 +720,13 @@ TEST_CASES_APPROVED_SESSION_KEY = "test_cases_approved"
 # Widget keys for the test cases review editors, under their own prefix.
 _TEST_CASES_WIDGET_PREFIX = "test_cases_review__"
 
+# The test execution data for the approved test cases, and whether the reviewer approved them.
+TEST_EXECUTION_SESSION_KEY = "test_execution_data"
+TEST_EXECUTION_APPROVED_SESSION_KEY = "test_execution_approved"
+
+# Widget keys for the test execution review editors, under their own prefix.
+_TEST_EXECUTION_WIDGET_PREFIX = "test_execution_review__"
+
 
 def _clear_prd_widgets() -> None:
     """Drop PRD review-editor widget state."""
@@ -740,6 +747,30 @@ def _clear_test_cases_state() -> None:
     for key in list(st.session_state.keys()):
         if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
             st.session_state.pop(key, None)
+
+
+def _clear_test_execution_state() -> None:
+    """
+    Forget the test execution data, their approval, and their review editors.
+    """
+    for key in (
+        TEST_EXECUTION_SESSION_KEY,
+        TEST_EXECUTION_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_TEST_EXECUTION_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _held_test_execution():
+    test_execution = st.session_state.get(TEST_EXECUTION_SESSION_KEY)
+    return test_execution if isinstance(test_execution, (list, tuple)) else None
+
+
+def _persist_test_execution(test_execution) -> list:
+    st.session_state[TEST_EXECUTION_SESSION_KEY] = test_execution
+    return test_execution
 
 
 def _clear_implementation_plan_state() -> None:
@@ -3811,6 +3842,188 @@ def _render_test_cases_stage(lifecycle) -> None:
         st.caption("Test cases updated. Review your changes and approve when ready.")
 
 
+def _render_test_execution_traceability(test_cases, test_execution) -> None:
+    """Show traceability from test execution back to test cases."""
+    if not test_cases:
+        st.caption("No test cases available.")
+        return
+
+    st.caption(
+        "Traceability: Test execution results for {} test case(s). "
+        "Each result links back to its test case, story and Jira issue.".format(
+            sum(len(suite.test_cases) for suite in test_cases)
+        )
+    )
+
+
+def _render_test_execution_editor(test_cases) -> list:
+    """Review and update surface for test execution results.
+
+    Test IDs are shown but not editable to preserve traceability.
+    Story reference is shown but not editable to preserve traceability.
+    """
+    if not test_cases:
+        return []
+
+    updated_suites = []
+    for suite_idx, suite in enumerate(test_cases):
+        updated_test_cases = []
+        for tc_idx, test_case in enumerate(suite.test_cases):
+            with st.container(border=True):
+                st.markdown(f"**Test Case {tc_idx + 1}: {test_case.test_id}**")
+                st.caption(f"*Story Reference:* `{test_case.story_reference}` (read-only)")
+                st.caption(f"*Scenario:* {test_case.scenario}")
+                st.caption(f"*Type:* {test_case.test_type} | *Priority:* {test_case.priority}")
+
+                # Execution status
+                status_options = [
+                    TEST_EXECUTION_NOT_RUN,
+                    TEST_EXECUTION_PASS,
+                    TEST_EXECUTION_FAIL,
+                    TEST_EXECUTION_BLOCKED,
+                ]
+                try:
+                    status_index = status_options.index(test_case.execution_status)
+                except ValueError:
+                    status_index = 0
+
+                new_status = st.selectbox(
+                    "Execution Status",
+                    options=status_options,
+                    index=status_index,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_status",
+                )
+
+                # Actual result
+                new_actual_result = st.text_area(
+                    "Actual Result",
+                    value=test_case.actual_result,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_actual_result",
+                    height=68,
+                )
+
+                # Notes
+                new_notes = st.text_area(
+                    "Notes",
+                    value=test_case.notes,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_notes",
+                    height=68,
+                )
+
+                # Defect reference
+                new_defect_reference = st.text_input(
+                    "Defect/Bug Reference (optional)",
+                    value=test_case.defect_reference,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_defect",
+                )
+
+                # Create updated test case with execution data
+                updated_test_case = TestCase(
+                    test_id=test_case.test_id,
+                    story_reference=test_case.story_reference,
+                    scenario=test_case.scenario,
+                    preconditions=test_case.preconditions,
+                    steps=test_case.steps,
+                    expected_result=test_case.expected_result,
+                    priority=test_case.priority,
+                    test_type=test_case.test_type,
+                    is_approved=test_case.is_approved,
+                    execution_status=new_status,
+                    actual_result=new_actual_result,
+                    notes=new_notes,
+                    defect_reference=new_defect_reference,
+                )
+                updated_test_cases.append(updated_test_case)
+
+        updated_suite = TestSuite(
+            story_id=suite.story_id,
+            test_cases=updated_test_cases
+        )
+        updated_suites.append(updated_suite)
+
+    return updated_suites
+
+
+def _render_test_execution_stage(lifecycle) -> None:
+    """
+    The test execution stage: record execution results from the approved test cases.
+
+    Blocked safely when the upstream test cases are missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent evidence.
+    Nothing here writes to Jira or anywhere else -- nothing is marked Done merely
+    because test execution was recorded.
+    """
+    test_cases = _held_test_cases()
+    if test_cases is None:
+        st.info(
+            "No test cases have been generated yet. Open the Test Cases stage and "
+            "generate them first; test execution is recorded against approved test cases."
+        )
+        return
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info(
+            "The test cases are pending review. Open the Test Cases stage and approve "
+            "them to record execution results."
+        )
+        return
+
+    _render_test_execution_traceability(test_cases, _held_test_execution())
+
+    # Edit mode: show editable test execution
+    updated_suites = _render_test_execution_editor(test_cases)
+    if updated_suites:
+        _persist_test_execution(updated_suites)
+        st.caption("Test execution results updated.")
+
+    # Show summary
+    if _held_test_execution():
+        updated_suites = _held_test_execution()
+    else:
+        updated_suites = test_cases
+
+    if not updated_suites:
+        return
+
+    # Count execution results
+    total_tests = 0
+    passed = 0
+    failed = 0
+    blocked = 0
+    not_run = 0
+    defects = []
+
+    for suite in updated_suites:
+        for tc in suite.test_cases:
+            total_tests += 1
+            if tc.execution_status == TEST_EXECUTION_PASS:
+                passed += 1
+            elif tc.execution_status == TEST_EXECUTION_FAIL:
+                failed += 1
+                if tc.defect_reference:
+                    defects.append(f"{tc.test_id}: {tc.defect_reference}")
+            elif tc.execution_status == TEST_EXECUTION_BLOCKED:
+                blocked += 1
+            else:
+                not_run += 1
+
+    st.markdown("**Execution Summary:**")
+    st.markdown(f"- Total: {total_tests}")
+    st.markdown(f"- Passed: {passed}")
+    st.markdown(f"- Failed: {failed}")
+    st.markdown(f"- Blocked: {blocked}")
+    st.markdown(f"- Not Run: {not_run}")
+
+    if defects:
+        st.markdown("**Defects/Bugs:**")
+        for defect in defects:
+            st.markdown(f"- {defect}")
+
+    st.caption(
+        "Recording execution results does not mark Jira issues as Done. Completion "
+        "requires explicit confirmation based on actual evidence."
+    )
+
+
 def _render_lifecycle_stage(lifecycle, stage: str) -> None:
     """
     One stage: its status, and either where it already lives or that it is not built.
@@ -3845,6 +4058,8 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
         _render_implementation_plan_stage(lifecycle)
     elif stage == TEST_CASES:
         _render_test_cases_stage(lifecycle)
+    elif stage == TEST_EXECUTION:
+        _render_test_execution_stage(lifecycle)
     elif stage == DELIVERY_STATUS:
         st.caption(
             "The Jira connection, site and project selection, work plan, review and "

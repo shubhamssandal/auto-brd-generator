@@ -31,6 +31,7 @@ from lifecycle_models import (
     PRD,
     STAGE_LABEL,
     TEST_CASES,
+    TEST_EXECUTION,
     ProjectLifecycle,
     StageState,
     lifecycle_from,
@@ -66,6 +67,7 @@ def test_the_lifecycle_is_the_eight_stages_in_delivery_order():
         ARCHITECTURE,
         IMPLEMENTATION_PLAN,
         TEST_CASES,
+        TEST_EXECUTION,
         DELIVERY_STATUS,
     )
 

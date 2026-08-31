@@ -1,6 +1,18 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+# Execution statuses for test execution stage
+TEST_EXECUTION_NOT_RUN = "Not Run"
+TEST_EXECUTION_PASS = "Pass"
+TEST_EXECUTION_FAIL = "Fail"
+TEST_EXECUTION_BLOCKED = "Blocked"
+
+# Execution statuses for test execution stage
+TEST_EXECUTION_NOT_RUN = "Not Run"
+TEST_EXECUTION_PASS = "Pass"
+TEST_EXECUTION_FAIL = "Fail"
+TEST_EXECUTION_BLOCKED = "Blocked"
+
 @dataclass
 class TestCase:
     test_id: str
@@ -12,6 +24,12 @@ class TestCase:
     priority: str = "Medium"
     test_type: str = "Functional"
     is_approved: bool = False
+
+    # Test execution tracking
+    execution_status: str = TEST_EXECUTION_NOT_RUN
+    actual_result: str = ""
+    notes: str = ""
+    defect_reference: str = ""
 
 @dataclass
 class TestSuite:
