@@ -46,6 +46,7 @@ from lifecycle_models import (
     PRD,
     STAGE_LABEL,
     TEST_CASES,
+    TEST_EXECUTION,
     lifecycle_from,
 )
 from jira_planner import action_item_index, generate_work_plan
@@ -61,6 +62,8 @@ from prd_generator import generate_prd
 from prd_models import PRDData
 from test_case_generator import generate_test_suite, _fallback_test_suite
 from test_case_models import TestCase, TestSuite, TEST_EXECUTION_NOT_RUN, TEST_EXECUTION_PASS, TEST_EXECUTION_FAIL, TEST_EXECUTION_BLOCKED
+from sprint_completion import complete_sprint, recommend_next_sprint
+from sprint_completion_models import SprintCompletion
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -726,6 +729,13 @@ TEST_EXECUTION_APPROVED_SESSION_KEY = "test_execution_approved"
 
 # Widget keys for the test execution review editors, under their own prefix.
 _TEST_EXECUTION_WIDGET_PREFIX = "test_execution_review__"
+
+# Sprint Completion capability: history of completed sprints and the next-sprint proposal.
+# Capability lives inside the existing Delivery Status area; not a 9th navigation stage.
+SPRINT_COMPLETION_HISTORY_KEY = "sprint_completion_history"
+SPRINT_COMPLETION_LAST_KEY = "sprint_completion_last"
+SPRINT_COMPLETION_NEXT_KEY = "sprint_completion_next"
+SPRINT_COMPLETION_APPROVED_KEY = "sprint_completion_next_approved"
 
 
 def _clear_prd_widgets() -> None:
@@ -3759,6 +3769,154 @@ def _render_plan_delivery_status(lifecycle) -> None:
     )
 
 
+def _render_sprint_completion_capability(lifecycle) -> None:
+    """
+    Sprint Completion capability: evaluate the current sprint using implementation,
+    review, and test evidence; propose next sprint; preserve history.
+    This capability lives inside the Delivery Status area and is not a separate
+    lifecycle stage.
+    """
+    # Need approved implementation plan and test cases to evaluate a sprint
+    plan = lifecycle.implementation_plan
+    if plan is None or getattr(plan, "is_empty", True):
+        st.info(
+            "Generate and approve an implementation plan to use sprint completion."
+        )
+        return
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.info(
+            "The implementation plan is pending review. Approve it to enable sprint completion."
+        )
+        return
+    test_cases = _held_test_cases()
+    if test_cases is None:
+        st.info(
+            "Generate test cases to enable sprint completion evidence evaluation."
+        )
+        return
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info(
+            "The test cases are pending review. Approve them to enable sprint completion."
+        )
+        return
+
+    # Find the most recent sprint plan in delivery mapping (if any) or session
+    mapping = st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping"))
+    if mapping is None or mapping.is_empty:
+        st.info(
+            "Create Jira issues from the implementation plan to enable sprint completion."
+        )
+        return
+
+    # For simplicity, we assume the delivery mapping contains the current sprint's issues.
+    # In a fuller implementation, we would have a selected sprint plan stored in session.
+    # Here we reuse the existing sprint recommendation logic to get a plan from the mapping.
+    from sprint_generator import recommend_sprint
+    sprint_plan = recommend_sprint(mapping)
+    if sprint_plan is None or getattr(sprint_plan, "is_empty", True):
+        st.info(
+            "The delivery mapping contains no issues; cannot evaluate sprint completion."
+        )
+        return
+
+    # Evaluate sprint completion using the evidence we have
+    sprint_completion = complete_sprint(
+        lifecycle, sprint_plan, test_cases=test_cases
+    )
+
+    # Display completion results
+    st.markdown("### Sprint Completion")
+    st.markdown(f"**Sprint:** {sprint_plan.sprint_name}")
+    st.markdown(f"**Goal:** {sprint_plan.sprint_goal}")
+    st.markdown(f"**Status:** {sprint_completion.overall_status}")
+    if sprint_completion.approved:
+        st.success("✅ Sprint completion approved by reviewer")
+    else:
+        st.warning("⏳ Sprint completion pending reviewer approval")
+
+    # Show per-story completion
+    completed_count = sum(
+        1 for sc in sprint_completion.story_completions if sc.is_completed
+    )
+    total_stories = len(sprint_completion.story_completions)
+    st.caption(
+        f"{completed_count}/{total_stories} stories complete "
+        f"({sprint_completion.overall_status.lower()})"
+    )
+
+    with st.expander("Story completion details"):
+        for sc in sprint_completion.story_completions:
+            status = "✅ Done" if sc.is_completed else "❌ Not done"
+            st.markdown(
+                f"- **{sc.story_id or '(no story id)'}**: {status} — {sc.detail}"
+            )
+
+    # Show remaining backlog (unfinished stories carried forward)
+    if sprint_completion.remaining_backlog:
+        st.markdown("### Remaining Backlog")
+        st.caption(
+            "These stories were not completed and will be carried into the next sprint."
+        )
+        for issue in sprint_completion.remaining_backlog:
+            st.markdown(
+                f"- **{issue.issue_key}**: {issue.summary}"
+                f"  \n  *{issue.rationale}*"
+            )
+
+    # Show next sprint recommendation
+    next_sprint = recommend_next_sprint(lifecycle, sprint_completion)
+    st.markdown("### Next Sprint Recommendation")
+    st.markdown(f"**Sprint:** {next_sprint.sprint_name}")
+    st.markdown(f"**Goal:** {next_sprint.sprint_goal}")
+    st.markdown(f"**Duration:** {next_sprint.duration_weeks} weeks")
+
+    # Approval controls for the next sprint
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(
+            "Approve Next Sprint",
+            key="sprint_completion_approve_next",
+            disabled=sprint_completion.approved,
+        ):
+            # Mark the next sprint as approved (store in session)
+            st.session_state[SPRINT_COMPLETION_NEXT_KEY] = next_sprint
+            st.session_state[SPRINT_COMPLETION_APPROVED_KEY] = True
+            st.success("Next sprint approved")
+            st.rerun()
+    with col2:
+        if st.button(
+            "Save Sprint Completion",
+            key="sprint_completion_save",
+            disabled=sprint_completion.approved,
+        ):
+            # Save this sprint completion to history
+            history = st.session_state.get(SPRINT_COMPLETION_HISTORY_KEY, [])
+            history.append(sprint_completion)
+            st.session_state[SPRINT_COMPLETION_HISTORY_KEY] = history
+            st.session_state[SPRINT_COMPLETION_LAST_KEY] = sprint_completion
+            st.success("Sprint completion saved to history")
+            st.rerun()
+
+    # Show history of saved sprint completions
+    history = st.session_state.get(SPRINT_COMPLETION_HISTORY_KEY, [])
+    if history:
+        st.markdown("### Sprint Completion History")
+        st.caption(f"Saved completions: {len(history)}")
+        for i, sc in enumerate(reversed(history)):
+            with st.expander(
+                f"{sc.sprint_plan.sprint_name} — {sc.overall_status} "
+                f"({'✅ Approved' if sc.approved else '⏳ Pending'})"
+            ):
+                st.markdown(f"**Goal:** {sc.sprint_plan.sprint_goal}")
+                completed = sum(
+                    1 for s in sc.story_completions if s.is_completed
+                )
+                total = len(sc.story_completions)
+                st.caption(f"{completed}/{total} stories complete")
+                if not sc.approved:
+                    st.caption("⏳ Pending reviewer approval")
+
+
 def _render_test_cases_stage(lifecycle) -> None:
     """
     The test cases stage: generate from the approved implementation plan, review, edit,
@@ -4069,6 +4227,7 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
             "plan item → issue key mapping."
         )
         _render_plan_delivery_status(lifecycle)
+        _render_sprint_completion_capability(lifecycle)
     else:
         st.info(
             "{} is not implemented yet. Nothing here generates an artifact.".format(

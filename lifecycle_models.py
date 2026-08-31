@@ -381,6 +381,40 @@ def _test_execution_state(test_cases) -> tuple:
         status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
         return (PENDING_REVIEW, status_detail)
 
+def _sprint_completion_state(sprint_completion, sprint_completion_approved: bool) -> tuple:
+    """
+    The sprint completion stage's ``(status, detail)``.
+
+    The gate is the *approved* sprint plan: completing a sprint against an unapproved
+    plan would be meaningless. We derive status from the sprint completion
+    results stored on the sprint completion object.
+    """
+    if sprint_completion is None:
+        return (
+            NOT_STARTED,
+            "No sprint has been completed yet. Complete a sprint first.",
+        )
+
+    # Get overall sprint status
+    overall_status = getattr(sprint_completion, 'overall_status', "In Progress")
+    completed_count = len(getattr(sprint_completion, 'completed_stories', []))
+    total_stories = len(getattr(sprint_completion, 'story_completions', []))
+    remaining_count = len(getattr(sprint_completion, 'remaining_backlog', []))
+
+    # Determine status and detail
+    if sprint_completion_approved:
+        status_detail = f"Sprint completed: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (COMPLETED, status_detail)
+    elif overall_status == "Completed":
+        status_detail = f"Sprint completed: {completed_count}/{total_stories} stories completed, {remaining_count} remaining. Review and approve below."
+        return (PENDING_REVIEW, status_detail)
+    elif overall_status == "Blocked":
+        status_detail = f"Sprint blocked: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (IN_PROGRESS, status_detail)
+    else:
+        status_detail = f"Sprint in progress: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (IN_PROGRESS, status_detail)
+
 
 def lifecycle_from(
     brd: Optional[BRDData] = None,
@@ -397,6 +431,8 @@ def lifecycle_from(
     test_cases=None,
     test_cases_approved: bool = False,
     delivery_mapping=None,
+    sprint_completion=None,
+    sprint_completion_approved: bool = False,
 ) -> ProjectLifecycle:
     """
     Derive the current lifecycle from the artifacts this session actually holds.
@@ -528,5 +564,6 @@ def lifecycle_from(
             NOT_STARTED,
             "No Jira work plan has been generated in this session yet.",
         )
+
 
     return lifecycle

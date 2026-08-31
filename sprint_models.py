@@ -7,6 +7,7 @@ class SprintIssue:
     summary: str = ""
     rationale: str = ""
     is_selected: bool = False
+    story_id: str = ""
 
 @dataclass
 class SprintPlan:
