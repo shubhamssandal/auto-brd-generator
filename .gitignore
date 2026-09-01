@@ -22,3 +22,7 @@ __pycache__/
 
 .claude/
 skills-lock.json
+
+# Graphify generated cache
+graphify-out/cache/
+graphify-out/cache/

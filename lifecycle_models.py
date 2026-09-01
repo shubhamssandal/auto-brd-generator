@@ -1,0 +1,569 @@
+"""
+The project delivery lifecycle: which artifact exists, and how far it has been reviewed.
+
+The product is moving from "generate one BRD" to a staged delivery lifecycle:
+
+    Discovery -> BRD -> PRD -> Architecture -> Implementation Plan -> Sprint Planning
+    -> Test Cases -> Test Execution -> Jira / Delivery Status
+
+This module holds only the state of that progression. It deliberately does *not*
+define a test case or a sprint: those generators do not exist yet, and a placeholder
+shape for an artifact nobody can produce would be a guess that the real implementation
+would have to undo. Until a stage has a generator it carries a ``StageState`` and
+nothing more.
+
+Nothing here duplicates an existing model. The BRD is the existing
+``brd_models.BRDData``, the PRD the existing ``prd_models.PRDData``, the architecture the
+existing ``architecture_models.ArchitectureData``, the implementation plan the existing
+``implementation_plan_models.ImplementationPlan``; the Jira work plan and creation
+results stay in ``jira_models`` and are read, not copied, when the delivery stage's
+status is derived.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from architecture_models import ArchitectureData
+from brd_models import BRDData
+from implementation_plan_models import ImplementationPlan
+from prd_models import PRDData
+
+# Import test execution constants
+from test_case_models import (
+    TEST_EXECUTION_NOT_RUN,
+    TEST_EXECUTION_PASS,
+    TEST_EXECUTION_FAIL,
+    TEST_EXECUTION_BLOCKED,
+)
+
+# --- Stages ---------------------------------------------------------------
+
+DISCOVERY_BRD = "discovery_brd"
+PRD = "prd"
+ARCHITECTURE = "architecture"
+IMPLEMENTATION_PLAN = "implementation_plan"
+SPRINT_PLAN = "sprint_plan"
+TEST_CASES = "test_cases"
+TEST_EXECUTION = "test_execution"
+DELIVERY_STATUS = "delivery_status"
+
+# Ordered, and the order is the lifecycle: a stage's inputs are the stages before it.
+STAGE_LABELS = (
+    (DISCOVERY_BRD, "Discovery → BRD"),
+    (PRD, "Product Definition → PRD"),
+    (ARCHITECTURE, "Architecture"),
+    (IMPLEMENTATION_PLAN, "Implementation Plan"),
+    (SPRINT_PLAN, "Sprint Planning"),
+    (TEST_CASES, "Test Cases"),
+    (TEST_EXECUTION, "Test Execution"),
+    (DELIVERY_STATUS, "Jira / Delivery Status"),
+)
+LIFECYCLE_STAGES = tuple(stage for stage, _ in STAGE_LABELS)
+STAGE_LABEL = dict(STAGE_LABELS)
+
+# The stages that have a working implementation today. Everything else is navigable so
+# the shape of the product is visible, and is reported as not implemented rather than
+# given a control that would do nothing.
+IMPLEMENTED_STAGES = (
+    DISCOVERY_BRD,
+    PRD,
+    ARCHITECTURE,
+    IMPLEMENTATION_PLAN,
+    TEST_CASES,
+    TEST_EXECUTION,
+    DELIVERY_STATUS,
+)
+
+# --- Stage state ----------------------------------------------------------
+
+NOT_STARTED = "Not Started"
+DRAFT = "Draft"
+PENDING_REVIEW = "Pending Review"
+APPROVED = "Approved"
+IN_PROGRESS = "In Progress"
+COMPLETED = "Completed"
+
+STAGE_STATES = (NOT_STARTED, DRAFT, PENDING_REVIEW, APPROVED, IN_PROGRESS, COMPLETED)
+
+# What a stage with no generator yet reports, so the UI never has to invent wording.
+NOT_IMPLEMENTED_DETAIL = "Planned for a later phase — not implemented yet."
+
+
+@dataclass(frozen=True)
+class StageState:
+    """One stage's status, and the one line that explains why it holds that status."""
+
+    status: str = NOT_STARTED
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        # A status outside the vocabulary would render as a state the rest of the app
+        # cannot reason about, so it is refused where it is set rather than displayed.
+        if self.status not in STAGE_STATES:
+            raise ValueError(
+                "Unknown lifecycle status {!r}. Expected one of: {}.".format(
+                    self.status, ", ".join(STAGE_STATES)
+                )
+            )
+
+
+@dataclass
+class ProjectLifecycle:
+    """
+    One project's progress through the lifecycle.
+
+    ``brd`` is the artifact that exists today, held by reference. ``discovery_source``
+    records which ingestion route produced it, because "where did this come from" is
+    part of the artifact's provenance and the transcript itself is not kept. ``prd`` is
+    the product definition derived from an approved ``brd``, ``architecture`` the
+    technical design derived from an approved ``prd``, and ``implementation_plan`` the
+    engineering structure derived from both.
+    """
+
+    project_title: str = ""
+    discovery_source: str = ""
+    brd: Optional[BRDData] = None
+    prd: Optional[PRDData] = None
+    architecture: Optional[ArchitectureData] = None
+    implementation_plan: Optional[ImplementationPlan] = None
+    test_cases: object = None
+    test_cases_approved: bool = False
+    stages: dict = field(default_factory=dict)
+
+    def state(self, stage: str) -> StageState:
+        """This stage's state, defaulting to not started."""
+        return self.stages.get(stage, StageState())
+
+    def record(self, stage: str, status: str, detail: str = "") -> None:
+        """Set one stage's state. Raises on an unknown stage or status."""
+        if stage not in LIFECYCLE_STAGES:
+            raise ValueError(
+                "Unknown lifecycle stage {!r}. Expected one of: {}.".format(
+                    stage, ", ".join(LIFECYCLE_STAGES)
+                )
+            )
+        self.stages[stage] = StageState(status=status, detail=detail)
+
+    @property
+    def is_started(self) -> bool:
+        return any(state.status != NOT_STARTED for state in self.stages.values())
+
+
+def _prd_state(brd, brd_approved: bool, prd, prd_approved: bool):
+    """
+    The PRD stage's ``(status, detail)``.
+
+    The gate is the *approved* BRD, not merely a generated one: the PRD stage says what
+    the product does about requirements the business has signed off. Approval is only
+    ever reported when the approval control set it.
+    """
+    if brd is None:
+        return (
+            NOT_STARTED,
+            "Generate a BRD first. The PRD is derived from the approved BRD.",
+        )
+    if not brd_approved:
+        return (
+            NOT_STARTED,
+            "The BRD is still pending review. Approve it to generate a PRD from it.",
+        )
+    if prd is None or getattr(prd, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "The approved BRD is ready. Generate a PRD from it, optionally with a "
+            "product-refinement transcript.",
+        )
+
+    covered = len(getattr(prd, "covered_requirement_ids", ()) or ())
+    total = len(getattr(prd, "source_requirement_ids", ()) or ())
+    coverage = "{} feature(s) covering {} of {} BRD requirement(s)".format(
+        len(getattr(prd, "features", ()) or ()), covered, total
+    )
+    if prd_approved:
+        return (APPROVED, coverage + ". Approved.")
+    if getattr(prd, "is_baseline", False):
+        return (
+            DRAFT,
+            coverage + ". This is the deterministic fallback -- one feature per "
+            "requirement, with no journeys or edge cases. Edit it, or generate again "
+            "with the AI generator available.",
+        )
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
+
+
+def _architecture_state(prd, prd_approved: bool, architecture, architecture_approved: bool):
+    """
+    The architecture stage's ``(status, detail)``.
+
+    The gate is the *approved* PRD: an architecture designed against product behaviour
+    nobody has signed off would have to be redesigned. As with the PRD, approval is only
+    ever reported when the approval control set it.
+    """
+    if prd is None or getattr(prd, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "Generate a PRD first. The architecture is derived from the approved PRD.",
+        )
+    if not prd_approved:
+        return (
+            NOT_STARTED,
+            "The PRD is still pending review. Approve it to generate an architecture "
+            "from it.",
+        )
+    if architecture is None or getattr(architecture, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "The approved PRD is ready. Generate an architecture from it, optionally with "
+            "an architecture discussion transcript.",
+        )
+
+    covered = len(getattr(architecture, "covered_feature_ids", ()) or ())
+    total = len(getattr(architecture, "source_feature_ids", ()) or ())
+    coverage = "{} component(s) realising {} of {} PRD feature(s)".format(
+        len(getattr(architecture, "components", ()) or ()), covered, total
+    )
+    if architecture_approved:
+        return (APPROVED, coverage + ". Approved.")
+    if getattr(architecture, "is_baseline", False):
+        return (
+            DRAFT,
+            coverage + ". This is the deterministic fallback -- one component per feature "
+            "in each layer, with no decisions, flows or risks. Edit it, or generate again "
+            "with the AI generator available.",
+        )
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
+
+
+def _implementation_plan_state(
+    architecture, architecture_approved: bool, plan, plan_approved: bool
+):
+    """
+    The implementation plan stage's ``(status, detail)``.
+
+    The gate is the *approved* architecture, which in turn carries the approved PRD and
+    BRD behind it: work decomposed against a design nobody signed off would have to be
+    re-decomposed. As with every stage above, approval is only ever reported when the
+    approval control set it.
+    """
+    if architecture is None or getattr(architecture, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "Generate an architecture first. The implementation plan is derived from the "
+            "approved PRD and architecture.",
+        )
+    if not architecture_approved:
+        return (
+            NOT_STARTED,
+            "The architecture is still pending review. Approve it to generate an "
+            "implementation plan from it.",
+        )
+    if plan is None or getattr(plan, "is_empty", True):
+        return (
+            NOT_STARTED,
+            "The approved architecture is ready. Generate an implementation plan of "
+            "epics, stories and technical tasks from it.",
+        )
+
+    coverage = (
+        "{} epic(s), {} story/stories and {} task(s) covering {} of {} PRD feature(s)"
+    ).format(
+        len(getattr(plan, "epics", ()) or ()),
+        len(getattr(plan, "stories", ()) or ()),
+        getattr(plan, "task_count", 0),
+        len(getattr(plan, "covered_feature_ids", ()) or ()),
+        len(getattr(plan, "source_feature_ids", ()) or ()),
+    )
+    if plan_approved:
+        return (APPROVED, coverage + ". Approved as the basis for delivery.")
+    if getattr(plan, "is_baseline", False):
+        return (
+            DRAFT,
+            coverage + ". This is the deterministic fallback -- one epic and story per "
+            "feature, with no sequencing or estimates. Edit it, or generate again with "
+            "the AI planner available.",
+        )
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve it below.")
+
+
+def _test_cases_state(test_cases, test_cases_approved: bool):
+    """
+    The test cases stage's ``(status, detail)``.
+
+    The gate is the *approved* implementation plan: test cases derived against work
+    nobody signed off would have to be regenerated. As with every stage above,
+    approval is only ever reported when the approval control set it.
+    """
+    if test_cases is None or not isinstance(test_cases, (list, tuple)):
+        return (
+            NOT_STARTED,
+            "No test cases have been generated yet. Generate them from the approved "
+            "implementation plan.",
+        )
+    test_suites = tuple(test_cases)
+    if not test_suites or all(not getattr(suite, "test_cases", []) for suite in test_suites):
+        return (
+            NOT_STARTED,
+            "The approved implementation plan is ready. Generate test cases from it.",
+        )
+
+    total_tests = sum(len(suite.test_cases) for suite in test_suites)
+    suite_count = len(test_suites)
+    coverage = "{} test case(s) across {} story/stories".format(total_tests, suite_count)
+    if test_cases_approved:
+        return (APPROVED, coverage + ". Approved.")
+    return (PENDING_REVIEW, coverage + ". Review, edit and approve below.")
+
+
+def _test_execution_state(test_cases) -> tuple:
+    """
+    The test execution stage's ``(status, detail)``.
+
+    The gate is the *approved* test cases: executing tests against unapproved test
+    cases would be meaningless. We derive status from the actual execution results
+    stored on the test cases themselves.
+    """
+    if test_cases is None or not isinstance(test_cases, (list, tuple)):
+        return (
+            NOT_STARTED,
+            "No test cases have been generated yet. Generate test cases first.",
+        )
+
+    # Flatten all test cases from all suites
+    all_test_cases = []
+    for suite in test_cases:
+        if hasattr(suite, 'test_cases'):
+            all_test_cases.extend(suite.test_cases)
+        elif isinstance(suite, (list, tuple)):
+            all_test_cases.extend(suite)
+
+    if not all_test_cases:
+        return (
+            NOT_STARTED,
+            "No test cases available for execution.",
+        )
+
+    # Count execution states
+    not_run_count = 0
+    pass_count = 0
+    fail_count = 0
+    blocked_count = 0
+
+    for tc in all_test_cases:
+        status = getattr(tc, 'execution_status', TEST_EXECUTION_NOT_RUN)
+        if status == TEST_EXECUTION_NOT_RUN:
+            not_run_count += 1
+        elif status == TEST_EXECUTION_PASS:
+            pass_count += 1
+        elif status == TEST_EXECUTION_FAIL:
+            fail_count += 1
+        elif status == TEST_EXECUTION_BLOCKED:
+            blocked_count += 1
+
+    total = len(all_test_cases)
+
+    # Determine overall status
+    if fail_count > 0:
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    elif blocked_count > 0:
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    elif not_run_count == 0 and pass_count > 0:
+        # All test cases have been run and passed
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (COMPLETED, status_detail)
+    elif pass_count > 0:
+        # Some test cases have been run and passed
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (IN_PROGRESS, status_detail)
+    else:
+        # No test cases have been run yet
+        status_detail = f"{pass_count} passed, {fail_count} failed, {blocked_count} blocked, {not_run_count} not run"
+        return (PENDING_REVIEW, status_detail)
+
+def _sprint_completion_state(sprint_completion, sprint_completion_approved: bool) -> tuple:
+    """
+    The sprint completion stage's ``(status, detail)``.
+
+    The gate is the *approved* sprint plan: completing a sprint against an unapproved
+    plan would be meaningless. We derive status from the sprint completion
+    results stored on the sprint completion object.
+    """
+    if sprint_completion is None:
+        return (
+            NOT_STARTED,
+            "No sprint has been completed yet. Complete a sprint first.",
+        )
+
+    # Get overall sprint status
+    overall_status = getattr(sprint_completion, 'overall_status', "In Progress")
+    completed_count = len(getattr(sprint_completion, 'completed_stories', []))
+    total_stories = len(getattr(sprint_completion, 'story_completions', []))
+    remaining_count = len(getattr(sprint_completion, 'remaining_backlog', []))
+
+    # Determine status and detail
+    if sprint_completion_approved:
+        status_detail = f"Sprint completed: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (COMPLETED, status_detail)
+    elif overall_status == "Completed":
+        status_detail = f"Sprint completed: {completed_count}/{total_stories} stories completed, {remaining_count} remaining. Review and approve below."
+        return (PENDING_REVIEW, status_detail)
+    elif overall_status == "Blocked":
+        status_detail = f"Sprint blocked: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (IN_PROGRESS, status_detail)
+    else:
+        status_detail = f"Sprint in progress: {completed_count}/{total_stories} stories completed, {remaining_count} remaining"
+        return (IN_PROGRESS, status_detail)
+
+
+def lifecycle_from(
+    brd: Optional[BRDData] = None,
+    discovery_source: str = "",
+    plan=None,
+    created=(),
+    brd_approved: bool = False,
+    prd: Optional[PRDData] = None,
+    prd_approved: bool = False,
+    architecture: Optional[ArchitectureData] = None,
+    architecture_approved: bool = False,
+    implementation_plan: Optional[ImplementationPlan] = None,
+    implementation_plan_approved: bool = False,
+    test_cases=None,
+    test_cases_approved: bool = False,
+    delivery_mapping=None,
+    sprint_completion=None,
+    sprint_completion_approved: bool = False,
+) -> ProjectLifecycle:
+    """
+    Derive the current lifecycle from the artifacts this session actually holds.
+
+    Read-only: every status comes from something that exists, so no stage can report
+    progress that was not made. A generated artifact reaches ``Pending Review`` and
+    stops there; ``brd_approved``, ``prd_approved``, ``architecture_approved`` and
+    ``implementation_plan_approved`` are set only by the explicit approval controls,
+    because moving an artifact to ``Approved`` on its own is the silent state change the
+    product direction forbids.
+
+    ``plan`` is a ``JiraWorkPlan`` and ``created`` the ``CreatedIssue`` results of a
+    creation run, both read positionally so this module stays independent of Jira. The
+    lifecycle's own ``implementation_plan`` is a different artifact entirely: it is the
+    engineering structure the delivery stage later turns into issues.
+
+    ``test_cases`` is the suite of generated test cases for the implementation plan.
+
+    ``delivery_mapping`` is the record of which approved implementation-plan items were
+    created as which Jira issues, read the same duck-typed way. It reports *creation*
+    evidence and never a Jira workflow status: nothing here reads an issue back, and
+    nothing a tracker says is allowed to change an artifact upstream of it.
+    """
+    lifecycle = ProjectLifecycle(
+        project_title=(brd.project_title if brd is not None else ""),
+        discovery_source=str(discovery_source or ""),
+        brd=brd,
+        prd=prd,
+        architecture=architecture,
+        implementation_plan=implementation_plan,
+        test_cases=test_cases,
+        test_cases_approved=test_cases_approved,
+    )
+
+    if brd is None:
+        lifecycle.record(
+            DISCOVERY_BRD,
+            NOT_STARTED,
+            "No transcript has been converted into a BRD in this session yet.",
+        )
+    else:
+        counts = "{} functional and {} non-functional requirement(s) generated{}.".format(
+            len(brd.functional_requirements),
+            len(brd.non_functional_requirements),
+            " from {}".format(discovery_source) if discovery_source else "",
+        )
+        if brd_approved:
+            lifecycle.record(
+                DISCOVERY_BRD,
+                APPROVED,
+                counts + " Approved as the basis for the PRD.",
+            )
+        else:
+            lifecycle.record(
+                DISCOVERY_BRD, PENDING_REVIEW, counts + " Review and approve it below."
+            )
+
+    lifecycle.record(PRD, *_prd_state(brd, brd_approved, prd, prd_approved))
+    # Revoking the BRD's approval unapproves everything derived from it: the PRD stage
+    # returns to Not Started, so the architecture behind it cannot still read as ready.
+    architecture_ready = prd_approved and brd_approved
+    lifecycle.record(
+        ARCHITECTURE,
+        *_architecture_state(prd, architecture_ready, architecture, architecture_approved)
+    )
+    # The same cascade one stage further down: the plan's gate is an approved architecture
+    # whose own upstream approvals still hold, so revoking any of them returns this stage
+    # to Not Started rather than leaving work planned against an unapproved design.
+    lifecycle.record(
+        IMPLEMENTATION_PLAN,
+        *_implementation_plan_state(
+            architecture,
+            architecture_approved and architecture_ready,
+            implementation_plan,
+            implementation_plan_approved,
+        )
+    )
+    test_cases_ready = implementation_plan_approved and architecture_ready
+    lifecycle.record(
+        TEST_CASES,
+        *_test_cases_state(test_cases if test_cases_ready else None, test_cases_approved and test_cases_ready),
+    )
+    lifecycle.record(
+        SPRINT_PLAN,
+        NOT_STARTED,
+        NOT_IMPLEMENTED_DETAIL
+    )
+    lifecycle.record(
+        TEST_EXECUTION,
+        *_test_execution_state(test_cases if test_cases_ready else None)
+    )
+
+    succeeded = tuple(
+        record for record in created or () if getattr(record, "succeeded", False)
+    )
+    delivered = int(getattr(delivery_mapping, "created_count", 0) or 0)
+    if succeeded and delivered:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            IN_PROGRESS,
+            "{} issue(s) created in Jira from the reviewed work plan, and {} approved "
+            "implementation-plan item(s) created as issues.".format(
+                len(succeeded), delivered
+            ),
+        )
+    elif delivered:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            IN_PROGRESS,
+            "{} approved implementation-plan item(s) created as Jira issues. Recorded "
+            "when they were created; no Jira workflow status is read.".format(delivered),
+        )
+    elif succeeded:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            IN_PROGRESS,
+            "{} issue(s) created in Jira from the reviewed work plan.".format(len(succeeded)),
+        )
+    elif plan is not None and not getattr(plan, "is_empty", False):
+        lifecycle.record(
+            DELIVERY_STATUS,
+            DRAFT,
+            "A work plan of {} proposed issue(s) is awaiting review. Nothing has been "
+            "created in Jira.".format(len(plan.issues)),
+        )
+    else:
+        lifecycle.record(
+            DELIVERY_STATUS,
+            NOT_STARTED,
+            "No Jira work plan has been generated in this session yet.",
+        )
+
+
+    return lifecycle

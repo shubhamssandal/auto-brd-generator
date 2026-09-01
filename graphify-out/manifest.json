@@ -1,0 +1,260 @@
+{
+  "brd_models.py": {
+    "mtime": 1787299061.678671,
+    "seen": 1787742894.009224,
+    "ast_hash": "44585dbb99b6a825e397373fdcd03987",
+    "semantic_hash": ""
+  },
+  "conftest.py": {
+    "mtime": 1787494372.7638514,
+    "seen": 1787742894.0092318,
+    "ast_hash": "5edd66134124847408407261988f5fe6",
+    "semantic_hash": ""
+  },
+  "jira_config.py": {
+    "mtime": 1787334737.273776,
+    "seen": 1787742894.009234,
+    "ast_hash": "eeb4ecc37123c5f6856c00f6ecaf59db",
+    "semantic_hash": ""
+  },
+  "jira_models.py": {
+    "mtime": 1787741696.8398123,
+    "seen": 1787742894.009235,
+    "ast_hash": "8485d2928e3fea571c4532e82aae5160",
+    "semantic_hash": ""
+  },
+  "jira_planner.py": {
+    "mtime": 1787494372.7659245,
+    "seen": 1787742894.0092359,
+    "ast_hash": "88eb5630d0b2cec2f7cd23a4a83d00ea",
+    "semantic_hash": ""
+  },
+  "jira_processor.py": {
+    "mtime": 1787728101.2038336,
+    "seen": 1787742894.0092359,
+    "ast_hash": "cd0bbba0361ce94d2deaa2907595f66d",
+    "semantic_hash": ""
+  },
+  "jira_service.py": {
+    "mtime": 1787728122.5526028,
+    "seen": 1787742894.009237,
+    "ast_hash": "0050d46a314c6cc52d813fa236b47afb",
+    "semantic_hash": ""
+  },
+  "lifecycle_models.py": {
+    "mtime": 1787728240.2864912,
+    "seen": 1787742894.009238,
+    "ast_hash": "1e680a3604b67e180c0618542f956718",
+    "semantic_hash": ""
+  },
+  "main.py": {
+    "mtime": 1787728360.191823,
+    "seen": 1787742894.009238,
+    "ast_hash": "16de2c981c46595ce98dede5757dbaca",
+    "semantic_hash": ""
+  },
+  "providers/__init__.py": {
+    "mtime": 1787306048.681197,
+    "seen": 1787742894.009239,
+    "ast_hash": "460969da77f6c0edb1441ba831b70b95",
+    "semantic_hash": ""
+  },
+  "providers/base.py": {
+    "mtime": 1787298929.5353987,
+    "seen": 1787742894.0092402,
+    "ast_hash": "d125a5cb8aec86243984205bf40ea377",
+    "semantic_hash": ""
+  },
+  "providers/google_meet.py": {
+    "mtime": 1787300161.3697987,
+    "seen": 1787742894.009241,
+    "ast_hash": "6ab2b092a9bc9c17e8f9228a898e499e",
+    "semantic_hash": ""
+  },
+  "providers/ms_teams.py": {
+    "mtime": 1787306018.1554728,
+    "seen": 1787742894.009241,
+    "ast_hash": "6db6ba398e4f6534a15e20095cf0ddd9",
+    "semantic_hash": ""
+  },
+  "providers/oauth_state.py": {
+    "mtime": 1787298354.0359068,
+    "seen": 1787742894.009242,
+    "ast_hash": "98dd1e4514f6d6aecc71b765ae5883c7",
+    "semantic_hash": ""
+  },
+  "providers/session_tokens.py": {
+    "mtime": 1787298785.2786925,
+    "seen": 1787742894.009251,
+    "ast_hash": "fda0a2574d948bf91e0bcd654c081ef1",
+    "semantic_hash": ""
+  },
+  "test_jira_config.py": {
+    "mtime": 1787335023.0016766,
+    "seen": 1787742894.009252,
+    "ast_hash": "ad10806610b56dbaa9cda0ca5e1f6f88",
+    "semantic_hash": ""
+  },
+  "test_jira_creation.py": {
+    "mtime": 1787494372.7689402,
+    "seen": 1787742894.009252,
+    "ast_hash": "0f155588ba51b961b45e04bfd2684ded",
+    "semantic_hash": ""
+  },
+  "test_jira_oauth.py": {
+    "mtime": 1787432750.5106301,
+    "seen": 1787742894.009253,
+    "ast_hash": "2fdf0ddb8b61880845509eb663be3a3d",
+    "semantic_hash": ""
+  },
+  "test_jira_planner.py": {
+    "mtime": 1787494372.769783,
+    "seen": 1787742894.009254,
+    "ast_hash": "8272bf12228e6cea982ebb08e19f053b",
+    "semantic_hash": ""
+  },
+  "test_jira_projects.py": {
+    "mtime": 1787432830.5588136,
+    "seen": 1787742894.009254,
+    "ast_hash": "dc37cb145e934813316864cef87a857d",
+    "semantic_hash": ""
+  },
+  "test_jira_sites.py": {
+    "mtime": 1787432790.3234217,
+    "seen": 1787742894.009255,
+    "ast_hash": "c184731512d5feeab9b0f561380da8f8",
+    "semantic_hash": ""
+  },
+  "test_jira_work_plan.py": {
+    "mtime": 1787405195.330626,
+    "seen": 1787742894.009256,
+    "ast_hash": "65b229751524b73c6e82d353ee6d0520",
+    "semantic_hash": ""
+  },
+  "test_jira_work_plan_review.py": {
+    "mtime": 1787418299.9990287,
+    "seen": 1787742894.009257,
+    "ast_hash": "f5169b1becd8efe7a16c09af00f14e79",
+    "semantic_hash": ""
+  },
+  "test_lifecycle_workspace.py": {
+    "mtime": 1787728980.0270076,
+    "seen": 1787742894.009257,
+    "ast_hash": "3afb77fa1d36f6b2ad914749734cb2eb",
+    "semantic_hash": ""
+  },
+  "test_main.py": {
+    "mtime": 1787292457.5484273,
+    "seen": 1787742894.009258,
+    "ast_hash": "c3bfb6b86d9eb3dbf740230a66f505e3",
+    "semantic_hash": ""
+  },
+  "test_main_integration.py": {
+    "mtime": 1787494372.770391,
+    "seen": 1787742894.009259,
+    "ast_hash": "fb18c1c92774d36cc42e052285b616f7",
+    "semantic_hash": ""
+  },
+  "test_oauth_security.py": {
+    "mtime": 1787307905.1897564,
+    "seen": 1787742894.009259,
+    "ast_hash": "26c130fad941803a247927a3be351e72",
+    "semantic_hash": ""
+  },
+  "test_providers_google.py": {
+    "mtime": 1787308121.1644614,
+    "seen": 1787742894.00926,
+    "ast_hash": "ef82cf01441a9135380e94538442d280",
+    "semantic_hash": ""
+  },
+  "test_providers_teams.py": {
+    "mtime": 1787308451.0872424,
+    "seen": 1787742894.00926,
+    "ast_hash": "66102f6dc650b4e94daae2f0df71c9fd",
+    "semantic_hash": ""
+  },
+  "test_transcript_ingestion.py": {
+    "mtime": 1787307386.4932623,
+    "seen": 1787742894.0092611,
+    "ast_hash": "a94797356d12d6295f1babaf8abb3624",
+    "semantic_hash": ""
+  },
+  "transcript_processor.py": {
+    "mtime": 1787291380.202396,
+    "seen": 1787742894.0092611,
+    "ast_hash": "11be3b9c586db5e71ded13ef7e680752",
+    "semantic_hash": ""
+  },
+  ".agents/rules/graphify.md": {
+    "mtime": 1787742870.4990945,
+    "seen": 1787742894.009262,
+    "ast_hash": "f1e53ecc9194573d3c28fc116c743a2e",
+    "semantic_hash": ""
+  },
+  ".agents/workflows/graphify.md": {
+    "mtime": 1787742870.4993317,
+    "seen": 1787742894.009263,
+    "ast_hash": "6d73634a678cf1e1c71930adf80bd1f0",
+    "semantic_hash": ""
+  },
+  "CLAUDE.md": {
+    "mtime": 1787726829.9386475,
+    "seen": 1787742894.009263,
+    "ast_hash": "5cbb2910f945de2d89aa5c36fd9e2c78",
+    "semantic_hash": ""
+  },
+  "FEATURE_TICKETS.md": {
+    "mtime": 1787300496.0,
+    "seen": 1787742894.0092642,
+    "ast_hash": "3609b8db85524135c95cb92da1953ab0",
+    "semantic_hash": ""
+  },
+  "FRONTEND_SPEC.md": {
+    "mtime": 1787300496.0,
+    "seen": 1787742894.0092642,
+    "ast_hash": "f9b362036b129bb1f8812f5e4ac73ab0",
+    "semantic_hash": ""
+  },
+  "PRD.md": {
+    "mtime": 1787300496.0,
+    "seen": 1787742894.009275,
+    "ast_hash": "54a5fc41e90108de7f759445c80fa140",
+    "semantic_hash": ""
+  },
+  "PROJECT_CONTEXT.md": {
+    "mtime": 1787206831.9720829,
+    "seen": 1787742894.009275,
+    "ast_hash": "ab3ef80ea59b22dc84f01e24d115b561",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1787742014.0393646,
+    "seen": 1787742894.009276,
+    "ast_hash": "c9e44efd791269d8fcb9af915a6d9d21",
+    "semantic_hash": ""
+  },
+  "SECURITY_AND_ACCESS.md": {
+    "mtime": 1787300496.0,
+    "seen": 1787742894.0092769,
+    "ast_hash": "3d304c45fa57870cc849e4da96f55187",
+    "semantic_hash": ""
+  },
+  "TECHNICAL_ARCHITECTURE.md": {
+    "mtime": 1787300496.0,
+    "seen": 1787742894.009284,
+    "ast_hash": "9a909d842f0ba2de3985ad0b97ade062",
+    "semantic_hash": ""
+  },
+  "requirements.txt": {
+    "mtime": 1787309040.452746,
+    "seen": 1787742894.009289,
+    "ast_hash": "8a659555b2742472645922124404de01",
+    "semantic_hash": ""
+  },
+  "sample_meeting_notes.txt": {
+    "mtime": 1787220597.8315377,
+    "seen": 1787742894.00929,
+    "ast_hash": "9d3165a9dd763287c8fb8bf23f16671f",
+    "semantic_hash": ""
+  }
+}

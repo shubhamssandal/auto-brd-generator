@@ -1,5 +1,7 @@
 import os
 import json
+import logging
+from dataclasses import replace
 from typing import Optional
 
 import streamlit as st
@@ -21,15 +23,53 @@ from transcript_processor import (
     normalize_uploaded_file,
     TranscriptProcessingError,
 )
-from jira_models import ChangeProposal, CreatedIssue
-from jira_change_detector import (
-    apply_approved_changes,
-    decide_change,
-    detect_jira_changes,
-    detect_meeting_changes,
-    synchronized_baseline,
+from jira_models import CreatedIssue
+from architecture_generator import generate_architecture
+from architecture_models import LAYERS, LAYER_LABEL, ArchitectureData
+from implementation_plan_generator import (
+    break_dependency_cycles,
+    generate_implementation_plan,
+)
+from implementation_plan_models import (
+    DEFAULT_PRIORITY,
+    PRIORITIES,
+    ImplementationPlan,
+    component_index,
+)
+from lifecycle_models import (
+    APPROVED,
+    ARCHITECTURE,
+    DELIVERY_STATUS,
+    DISCOVERY_BRD,
+    IMPLEMENTATION_PLAN,
+    IMPLEMENTED_STAGES,
+    LIFECYCLE_STAGES,
+    PRD,
+    STAGE_LABEL,
+    TEST_CASES,
+    TEST_EXECUTION,
+    lifecycle_from,
 )
 from jira_planner import action_item_index, generate_work_plan
+from implementation_plan_jira import (
+    DeliveryMapping,
+    delivery_progress,
+    known_issue_keys,
+    map_plan_to_work_plan,
+    pending_plan_keys,
+    record_created_issues,
+)
+from prd_generator import generate_prd
+from prd_models import PRDData
+from test_case_generator import generate_test_suite, _fallback_test_suite
+from test_case_models import TestCase, TestSuite, TEST_EXECUTION_NOT_RUN, TEST_EXECUTION_PASS, TEST_EXECUTION_FAIL, TEST_EXECUTION_BLOCKED
+from execution_engine import (
+    generate_execution_evidence,
+    get_execution_status_summary,
+    approve_test_execution,
+)
+from sprint_completion import complete_sprint, recommend_next_sprint
+from sprint_completion_models import SprintCompletion
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -76,6 +116,8 @@ if GEMINI_API_KEY:
 # The one model this app calls, named once so BRD generation and Jira work planning
 # cannot drift onto different models.
 GEMINI_MODEL = "gemini-3.6-flash"
+
+logger = logging.getLogger(__name__)
 
 
 def _gemini_json(prompt: str) -> str:
@@ -617,18 +659,20 @@ _JIRA_PROJECT_SUFFIXES = (
     "created",
     "creating",
     "confirm_create",
-    # JIRA-010. "changes" holds a detected requirement-change proposal. Its impact
-    # analysis names the plan keys and issue keys of this project, so it goes stale
-    # for exactly the same reasons the plan does and is dropped alongside it.
-    "changes",
-    # Immutable values sent at issue-creation time. Jira drift is compared against
-    # this snapshot, never against a plan the reviewer may later edit.
-    "change_baseline",
+    # The stable plan item -> issue key mapping an approved implementation plan
+    # produced in this project, the last run's per-item outcomes, and the guards for
+    # that one write. A mapping is only meaningful against the project its keys live
+    # in, so choosing a different project or disconnecting drops it with everything
+    # else here. The mapped proposal itself is not stored: it is recomputed from the
+    # approved plan and this project's metadata, so the preview cannot drift from the
+    # plan the reviewer approved.
+    "delivery_mapping",
+    "delivery_results",
+    "delivery_creating",
+    "delivery_confirm",
 )
 
-# The four evidence sources this app ingests. Named once because two pickers offer
-# them: the BRD generator above and requirement-change detection below, which compares
-# a later meeting against an approved BRD. Both routes reach the same normalizers.
+# The four evidence sources this app ingests, offered by the BRD generator below.
 TRANSCRIPT_SOURCES = (
     "Manual Paste",
     "Upload Transcript File (.txt)",
@@ -640,6 +684,169 @@ TRANSCRIPT_SOURCES = (
 # causes. Without it a work plan could never be generated: by the time the click is
 # handled, the run that produced the BRD is over.
 BRD_SESSION_KEY = "brd_data"
+
+# Which ingestion route produced that BRD. The transcript itself is not kept, so this
+# is all the provenance the Discovery stage can report.
+BRD_SOURCE_SESSION_KEY = "brd_source"
+
+# Whether the reviewer explicitly approved that BRD. The PRD stage is gated on it:
+# a generated BRD is a draft until a person says otherwise, and nothing sets this
+# except the approval button.
+BRD_APPROVED_SESSION_KEY = "brd_approved"
+
+# The PRD derived from the approved BRD, whether the reviewer approved it, and the
+# optional product-refinement transcript that enriched it.
+PRD_SESSION_KEY = "prd_data"
+PRD_APPROVED_SESSION_KEY = "prd_approved"
+PRD_REFINEMENT_SESSION_KEY = "prd_refinement"
+
+# Streamlit widget keys for the PRD review editors, kept under one prefix so a new PRD
+# cannot inherit the previous one's editor values.
+_PRD_WIDGET_PREFIX = "prd_review__"
+
+# The architecture derived from the approved PRD, whether the reviewer approved it, and
+# the optional architecture-discussion transcript that informed it.
+ARCHITECTURE_SESSION_KEY = "architecture_data"
+ARCHITECTURE_APPROVED_SESSION_KEY = "architecture_approved"
+ARCHITECTURE_DISCUSSION_SESSION_KEY = "architecture_discussion"
+
+# Widget keys for the architecture review editors, under their own prefix for the same
+# reason as the PRD's.
+_ARCH_WIDGET_PREFIX = "arch_review__"
+
+# The implementation plan derived from the approved PRD and architecture, and whether the
+# reviewer approved it. No transcript here: the plan is a decomposition of two approved
+# artifacts, and a fourth meeting would add opinion rather than evidence.
+IMPLEMENTATION_PLAN_SESSION_KEY = "implementation_plan_data"
+IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY = "implementation_plan_approved"
+
+# Widget keys for the implementation plan review editors, under their own prefix for the
+# same reason as the PRD's and the architecture's.
+_PLAN_WIDGET_PREFIX = "plan_review__"
+
+# The test cases derived from the approved implementation plan, and whether the reviewer approved them.
+TEST_CASES_SESSION_KEY = "test_cases_data"
+TEST_CASES_APPROVED_SESSION_KEY = "test_cases_approved"
+
+# Widget keys for the test cases review editors, under their own prefix.
+_TEST_CASES_WIDGET_PREFIX = "test_cases_review__"
+
+# The test execution data for the approved test cases, and whether the reviewer approved them.
+TEST_EXECUTION_SESSION_KEY = "test_execution_data"
+TEST_EXECUTION_APPROVED_SESSION_KEY = "test_execution_approved"
+
+# Widget keys for the test execution review editors, under their own prefix.
+_TEST_EXECUTION_WIDGET_PREFIX = "test_execution_review__"
+
+# Sprint Completion capability: history of completed sprints and the next-sprint proposal.
+# Capability lives inside the existing Delivery Status area; not a 9th navigation stage.
+SPRINT_COMPLETION_HISTORY_KEY = "sprint_completion_history"
+SPRINT_COMPLETION_LAST_KEY = "sprint_completion_last"
+SPRINT_COMPLETION_NEXT_KEY = "sprint_completion_next"
+SPRINT_COMPLETION_APPROVED_KEY = "sprint_completion_next_approved"
+
+
+def _clear_prd_widgets() -> None:
+    """Drop PRD review-editor widget state."""
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_PRD_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_test_cases_state() -> None:
+    """
+    Forget the test cases, their approval, and their review editors.
+    """
+    for key in (
+        TEST_CASES_SESSION_KEY,
+        TEST_CASES_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _clear_test_execution_state() -> None:
+    """
+    Forget the test execution data, their approval, and their review editors.
+    """
+    for key in (
+        TEST_EXECUTION_SESSION_KEY,
+        TEST_EXECUTION_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_TEST_EXECUTION_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _held_test_execution():
+    test_execution = st.session_state.get(TEST_EXECUTION_SESSION_KEY)
+    return test_execution if isinstance(test_execution, (list, tuple)) else None
+
+
+def _persist_test_execution(test_execution) -> list:
+    st.session_state[TEST_EXECUTION_SESSION_KEY] = test_execution
+    return test_execution
+
+
+def _clear_implementation_plan_state() -> None:
+    """
+    Forget the implementation plan, its approval and its editors.
+
+    Called when the architecture changes, for the reason the architecture is cleared when
+    the PRD changes: a plan decomposes one specific design, so a new design makes a held
+    plan wrong rather than merely old, and its approval cannot carry over to work nobody
+    has reviewed.
+    """
+    for key in (
+        IMPLEMENTATION_PLAN_SESSION_KEY,
+        IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_PLAN_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+    _clear_test_cases_state()
+
+
+def _clear_architecture_state() -> None:
+    """
+    Forget the architecture, its approval and its editors.
+
+    Called when the PRD changes for the same reason ``_clear_prd_state`` is called when
+    the BRD changes: an architecture is the design for one specific PRD, so a new PRD
+    makes a held architecture wrong rather than merely old. The implementation plan
+    decomposed from that architecture goes with it.
+    """
+    for key in (
+        ARCHITECTURE_SESSION_KEY,
+        ARCHITECTURE_APPROVED_SESSION_KEY,
+        ARCHITECTURE_DISCUSSION_SESSION_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_ARCH_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+    _clear_implementation_plan_state()
+    _clear_test_cases_state()
+
+
+def _clear_prd_state() -> None:
+    """
+    Forget the PRD, its approval and its editors.
+
+    Called when the BRD changes: a PRD is a product definition of one specific BRD, so
+    a new BRD makes a held PRD wrong rather than merely old, and its approval cannot
+    carry over to a document nobody has reviewed. The architecture derived from that PRD
+    goes with it.
+    """
+    for key in (PRD_SESSION_KEY, PRD_APPROVED_SESSION_KEY, PRD_REFINEMENT_SESSION_KEY):
+        st.session_state.pop(key, None)
+    _clear_prd_widgets()
+    _clear_architecture_state()
+
 
 # Streamlit widget keys for the work-plan review editors. Not under ``jira__``:
 # those suffixes are plan data, and a leftover text-input value would otherwise
@@ -681,7 +888,7 @@ def _clear_jira_project_state(service) -> None:
 JIRA_STATE_NAME = JiraService().name
 
 
-def _store_brd(brd_data: BRDData) -> None:
+def _store_brd(brd_data: BRDData, source: str = "") -> None:
     """
     Keep the generated BRD for the optional Jira step.
 
@@ -692,18 +899,19 @@ def _store_brd(brd_data: BRDData) -> None:
 
     A plan built from the previous BRD is dropped rather than left behind. A work
     plan is a proposal about one specific BRD, so a newly generated BRD makes a
-    cached plan wrong, not merely old. A detected requirement-change proposal goes
-    with it: it compares against the requirements that were approved when it ran.
+    cached plan wrong, not merely old. The same applies to a PRD and to any approval
+    recorded against the BRD that has just been replaced.
     """
     st.session_state[BRD_SESSION_KEY] = brd_data
+    st.session_state[BRD_SOURCE_SESSION_KEY] = str(source or "")
+    st.session_state.pop(BRD_APPROVED_SESSION_KEY, None)
+    _clear_prd_state()
     for suffix in (
         "plan",
         "plan_for",
         "created",
         "creating",
         "confirm_create",
-        "changes",
-        "change_baseline",
     ):
         st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
     _clear_jira_plan_review_widgets()
@@ -1323,6 +1531,7 @@ def _render_jira_projects_panel(service, tokens: TokenSet, site) -> None:
     _render_jira_project_metadata(metadata)
     _render_jira_work_plan_panel(project, metadata, wanted)
     _render_jira_creation_panel(service, tokens, site, project, metadata)
+    _render_plan_delivery_panel(service, tokens, site, project, metadata)
 
 
 def _render_jira_project_metadata(metadata) -> None:
@@ -1449,8 +1658,6 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
             "created",
             "creating",
             "confirm_create",
-            "changes",
-            "change_baseline",
         ):
             st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         _clear_jira_plan_review_widgets()
@@ -1458,14 +1665,11 @@ def _render_jira_work_plan_panel(project, metadata, scope) -> None:
     if st.button("Generate Jira Work Plan", key="generate_jira_work_plan"):
         _clear_jira_plan_review_widgets()
         # A regenerated plan is a different proposal, so a previous run's results and
-        # its in-flight guard must not carry over onto it. A change proposal goes too:
-        # its impact analysis names plan keys this new plan may not contain.
+        # its in-flight guard must not carry over onto it.
         for suffix in (
             "created",
             "creating",
             "confirm_create",
-            "changes",
-            "change_baseline",
         ):
             st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
         with st.spinner("Grouping BRD requirements into this project's hierarchy..."):
@@ -1762,7 +1966,7 @@ def _result_for(issue, **outcome) -> CreatedIssue:
     )
 
 
-def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
+def _create_selected_issues(service, tokens, cloud_id, project, plan, known_keys=None) -> tuple:
     """
     Create the selected issues, parents first, and report each outcome.
 
@@ -1770,12 +1974,20 @@ def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
     missing, and a run that half-built a hierarchy is harder to clean up than one that
     stopped where it broke.
 
+    ``known_keys`` maps a plan key to the Jira issue key it was *already* created as in
+    an earlier run. Such an item is not sent again -- its key is simply remembered so a
+    child created now is parented onto the real issue. This is what makes a retry after
+    a partial failure safe: Jira's create endpoint has no idempotency key, so a repeat
+    has to be prevented before the request rather than detected after it. Nothing passes
+    this argument for the BRD-derived plan, which has no cross-run mapping to consult.
+
     The token is refreshed *before* the run rather than in reaction to a 401, so no
     create is ever re-sent: ``JiraService.create_issue`` raises an authentication error
     on 401 instead of the expiry error ``call_with_refresh`` would retry.
     """
     created: list = []
-    keys_by_plan_key: dict = {}
+    keys_by_plan_key: dict = dict(known_keys or {})
+    already_created = set(keys_by_plan_key)
 
     if tokens.is_expired() and tokens.can_refresh():
         try:
@@ -1786,6 +1998,10 @@ def _create_selected_issues(service, tokens, cloud_id, project, plan) -> tuple:
             return ()
 
     for issue in creation_order(plan):
+        if issue.plan_key in already_created:
+            # Already in Jira. Skipped rather than re-sent, and no result is recorded:
+            # the mapping already holds the outcome this item had.
+            continue
         parent_key = keys_by_plan_key.get(issue.parent_plan_key, "")
         payload = issue_creation_payload(issue, project.api_identifier, parent_key)
         try:
@@ -1935,10 +2151,206 @@ def _render_jira_creation_panel(service, tokens, site, project, metadata) -> Non
 
     if results:
         st.session_state[created_key] = results
-        st.session_state[_skey(JIRA_STATE_NAME, "change_baseline")] = synchronized_baseline(
-            plan, results
-        )
     _render_created_results(results or (), site.url)
+
+
+def _approved_implementation_plan() -> tuple:
+    """
+    The approved implementation plan, or ``(None, why not)``.
+
+    The delivery gate. Mapping a draft plan onto issues would create work from
+    something nobody signed off, so an unapproved plan is refused here rather than
+    warned about later.
+    """
+    plan = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    if not isinstance(plan, ImplementationPlan) or plan.is_empty:
+        return None, (
+            "No implementation plan is held yet. Generate one in the Implementation Plan "
+            "stage — it needs an approved PRD and an approved architecture first."
+        )
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        return None, (
+            "This implementation plan is not approved yet. Review and approve it in the "
+            "Implementation Plan stage; nothing is created in Jira from a draft plan."
+        )
+    return plan, ""
+
+
+def _render_delivery_mapping(mapping, site_url: str = "") -> None:
+    """
+    The plan item → Jira issue mapping, which is the delivery record.
+
+    Rendered from the stored mapping rather than from a run, so it survives the reruns
+    that follow creation and stays readable after a partial failure.
+    """
+    if mapping is None or mapping.is_empty:
+        return
+    st.markdown("**Delivery mapping — implementation plan item → Jira issue**")
+    for link in mapping.links:
+        url = issue_browse_url(site_url, link.issue_key) if site_url else ""
+        shown = "[{}]({})".format(link.issue_key, url) if url else "`{}`".format(link.issue_key)
+        trace = []
+        if link.feature_ids:
+            trace.append("PRD {}".format(", ".join(link.feature_ids)))
+        if link.component_ids:
+            trace.append("architecture {}".format(", ".join(link.component_ids)))
+        st.write(
+            "- `{}` → {}{} — {}{}".format(
+                link.plan_item_id,
+                shown,
+                " ({})".format(link.issue_type_name) if link.issue_type_name else "",
+                link.summary or "",
+                " — traces to {}".format(" and ".join(trace)) if trace else "",
+            )
+        )
+
+
+def _render_plan_delivery_panel(service, tokens, site, project, metadata) -> None:
+    """
+    Step 6: an approved implementation plan onto this project's issues.
+
+    Four gates, in this order: the plan must be approved, the mapping must be valid
+    against this project's own hierarchy, the session must hold the write scope, and the
+    reviewer must confirm twice. Only the last branch writes, and only for plan items
+    that have no Jira issue yet — so a retry after a partial failure finishes the run
+    instead of duplicating what already exists.
+    """
+    st.markdown("**Step 6 — deliver the approved implementation plan**")
+
+    plan, blocked = _approved_implementation_plan()
+    if plan is None:
+        st.caption(blocked)
+        return
+
+    mapping_key = _skey(JIRA_STATE_NAME, "delivery_mapping")
+    results_key = _skey(JIRA_STATE_NAME, "delivery_results")
+    creating_key = _skey(JIRA_STATE_NAME, "delivery_creating")
+    confirm_key = _skey(JIRA_STATE_NAME, "delivery_confirm")
+
+    # Recomputed rather than cached, so what is previewed and created is always the
+    # plan that is currently approved against this project's current metadata.
+    work_plan = map_plan_to_work_plan(plan, metadata, project)
+    mapping = st.session_state.get(mapping_key)
+    if not isinstance(mapping, DeliveryMapping):
+        mapping = DeliveryMapping(
+            project_identifier=project.api_identifier,
+            project_label=project.display_label,
+            site_url=site.url,
+        )
+    results = st.session_state.get(results_key) or ()
+
+    for note in work_plan.notes:
+        st.info(note)
+
+    if work_plan.is_empty:
+        return
+
+    progress = delivery_progress(work_plan, mapping, results)
+    st.write(
+        "**{}** of **{}** mapped plan item(s) exist in **{}**.{}".format(
+            progress.created,
+            progress.total,
+            project.display_label,
+            " {} item(s) cannot be created in this project.".format(progress.excluded)
+            if progress.excluded
+            else "",
+        )
+    )
+    _render_delivery_mapping(mapping, site.url)
+    if results:
+        _render_created_results(results, site.url)
+
+    if progress.is_complete:
+        st.success(
+            "Every mapped plan item has a Jira issue. Delivery status is read from these "
+            "creation records; this app does not poll Jira for an issue's workflow state."
+        )
+        return
+
+    problems = validate_work_plan(work_plan, metadata, project)
+    if problems:
+        st.warning(
+            "This plan cannot be created in {} yet:".format(project.display_label)
+        )
+        for problem in problems:
+            st.write("- {}".format(problem))
+        return
+
+    granted = tokens.public_summary().get("scopes")
+    if granted and service.WRITE_SCOPE not in granted:
+        st.warning(
+            "This Jira session was authorized without `{}`, so it cannot create issues. "
+            "Disconnect and connect again to grant it. Nothing has been created.".format(
+                service.WRITE_SCOPE
+            )
+        )
+        return
+
+    pending = pending_plan_keys(work_plan, mapping)
+    if not pending:
+        st.caption("Nothing is left to create from this plan.")
+        return
+
+    verb = "Create" if not mapping.created_count else "Create the remaining"
+    st.caption(
+        "{} item(s) would be created: {}. Parents are created before the children that "
+        "name them, and an item that already has a Jira issue is skipped rather than "
+        "created again.".format(
+            len(pending), ", ".join("`{}`".format(key) for key in pending[:12])
+            + (", …" if len(pending) > 12 else "")
+        )
+    )
+
+    if not st.session_state.get(confirm_key):
+        if st.button(
+            "{} {} Issue(s) in Jira".format(verb, len(pending)), key="request_plan_delivery"
+        ):
+            st.session_state[confirm_key] = True
+            st.rerun()
+        return
+
+    st.warning(
+        "Confirm: create {} issue(s) in {} from the approved implementation plan. This "
+        "cannot be undone from this app.".format(len(pending), project.display_label)
+    )
+    confirmed = st.button("Yes — create them now", key="confirm_plan_delivery")
+    if st.button("Cancel", key="cancel_plan_delivery"):
+        st.session_state.pop(confirm_key, None)
+        st.rerun()
+        return
+    if not confirmed:
+        return
+
+    # Stored before the first request and cleared only after the run, so a rerun that
+    # arrives mid-run finds it set and cannot start a second one.
+    if st.session_state.get(creating_key):
+        st.info("A creation run is already in progress.")
+        return
+    st.session_state[creating_key] = True
+    try:
+        with st.spinner("Creating {} issue(s) in Jira...".format(len(pending))):
+            run = _create_selected_issues(
+                service,
+                tokens,
+                site.id,
+                project,
+                work_plan,
+                known_keys=known_issue_keys(mapping),
+            )
+    finally:
+        st.session_state.pop(creating_key, None)
+        st.session_state.pop(confirm_key, None)
+
+    # The mapping is folded in before anything is rendered, so even a run that failed
+    # part way through leaves the successes recorded and un-creatable a second time.
+    st.session_state[mapping_key] = record_created_issues(mapping, run, work_plan, plan)
+    st.session_state[results_key] = run
+    _render_created_results(run or (), site.url)
+    if any(not record.succeeded for record in run or ()):
+        st.info(
+            "The issues above that were created are recorded in the delivery mapping and "
+            "will not be created again. Use this step once more to create what is left."
+        )
 
 
 def _render_jira_section() -> None:
@@ -2025,354 +2437,2144 @@ def _render_jira_section() -> None:
     )
 
 
-# --- Requirement change detection ---
-
-# How each detected change kind is headed on its review card. The stored values are
-# the deterministic ones from ``jira_models.CHANGE_TYPES``; these are only labels.
-_CHANGE_HEADINGS = {
-    "NEW": "New requirement",
-    "CHANGED": "Changed requirement",
-    "REMOVED_DEFERRED": "Removed or deferred",
-    "UNCHANGED": "Unchanged",
-    "UNCLEAR": "Unclear — needs manual review",
-}
+# --- Project lifecycle workspace ---
 
 
-def _new_change_evidence(label: str) -> Optional[NormalizedTranscript]:
+def _brd_approved() -> bool:
+    """Whether the reviewer approved the BRD held in this session."""
+    return bool(st.session_state.get(BRD_APPROVED_SESSION_KEY))
+
+
+def _held_prd():
+    """The PRD this session holds, or ``None``."""
+    prd = st.session_state.get(PRD_SESSION_KEY)
+    return prd if isinstance(prd, PRDData) else None
+
+
+def _persist_prd(prd: PRDData) -> PRDData:
+    st.session_state[PRD_SESSION_KEY] = prd
+    return prd
+
+
+def _render_brd_approval() -> None:
     """
-    The later meeting to compare against the approved BRD, or ``None`` until asked.
+    The explicit BRD approval control, which is what unlocks the PRD stage.
 
-    Every route here is one this app already has. Pasted and uploaded text go through
-    the same two normalizers BRD generation uses, and Google Meet and Microsoft Teams
-    reuse the transcript already retrieved in the source section above rather than
-    fetching it a second time. There is no second ingestion path and no second
-    transcript shape: all four arrive as one ``NormalizedTranscript``.
+    Nothing else sets or clears this: generating a BRD leaves it pending, and
+    approving is a deliberate act recorded against the BRD in front of the reviewer.
     """
-    if label == "Manual Paste":
-        notes = st.text_area(
-            "Paste the notes from the later meeting",
-            height=200,
-            placeholder="Paste what was decided after the BRD was approved...",
-            key="change_notes",
-        )
-        if st.button("Detect requirement changes", key="detect_manual", type="primary"):
-            try:
-                return normalize_manual_notes(notes)
-            except TranscriptProcessingError as error:
-                st.error(str(error))
-        return None
-
-    if label == "Upload Transcript File (.txt)":
-        uploaded = st.file_uploader(
-            "Upload the later transcript",
-            type=["txt"],
-            key="change_upload",
-        )
-        if st.button("Detect requirement changes", key="detect_upload", type="primary"):
-            if uploaded is None:
-                st.error("Upload a .txt transcript file before detecting changes.")
-            else:
-                try:
-                    return normalize_uploaded_file(uploaded)
-                except TranscriptProcessingError as error:
-                    st.error(str(error))
-        return None
-
-    provider_name = "google_meet" if label == "Google Meet" else "microsoft_teams"
-    transcript = st.session_state.get(_skey(provider_name, "transcript"))
-    if not isinstance(transcript, NormalizedTranscript):
-        st.caption(
-            "No {} transcript is loaded in this session. Load one in the transcript "
-            "source section above and it can be compared here without being retrieved "
-            "again.".format(label)
-        )
-        return None
+    if _brd_approved():
+        st.success("This BRD is approved and is the basis for the PRD.")
+        if st.button("Revoke BRD approval", key="revoke_brd_approval"):
+            st.session_state[BRD_APPROVED_SESSION_KEY] = False
+            _flash(
+                "info",
+                "BRD approval was revoked. The PRD already generated from it is kept, "
+                "but the BRD is pending review again.",
+            )
+        return
 
     st.caption(
-        "Comparing the {} transcript already loaded above{}. It is not retrieved "
-        "again.".format(
-            label,
-            ": {}".format(transcript.meeting_title) if transcript.meeting_title else "",
-        )
+        "Approving records that you reviewed the requirements above. It creates nothing "
+        "and changes no requirement; it unlocks PRD generation from this BRD."
     )
-    if st.button(
-        "Detect requirement changes", key="detect_{}".format(provider_name), type="primary"
-    ):
+    if st.button("Approve BRD", key="approve_brd"):
+        st.session_state[BRD_APPROVED_SESSION_KEY] = True
+        _flash("success", "BRD approved. The PRD can now be generated from it.")
+
+
+def _prd_refinement() -> Optional[NormalizedTranscript]:
+    """
+    The optional product-refinement discussion, if the reviewer supplied one.
+
+    Optional by design: the PRD is derived from the approved BRD, and this only enriches
+    it. A transcript already loaded from a provider in this session can be reused rather
+    than pasted again; anything pasted here becomes the same ``NormalizedTranscript``
+    every other ingestion route produces.
+    """
+    loaded = [
+        value
+        for key, value in st.session_state.items()
+        if str(key).endswith("__transcript") and isinstance(value, NormalizedTranscript)
+    ]
+
+    with st.expander("Optional product-refinement discussion"):
+        st.caption(
+            "Not required. The PRD is generated from the approved BRD; a product "
+            "discussion only adds product detail on top of it."
+        )
+        if loaded:
+            transcript = loaded[0]
+            if st.checkbox(
+                "Use the {} transcript already loaded in this session".format(
+                    transcript.source or "loaded"
+                ),
+                key=_PRD_WIDGET_PREFIX + "use_loaded",
+            ):
+                st.session_state[PRD_REFINEMENT_SESSION_KEY] = transcript
+                return transcript
+
+        pasted = st.text_area(
+            "Paste a product-refinement discussion (optional)",
+            value="",
+            key=_PRD_WIDGET_PREFIX + "refinement_text",
+            height=140,
+        )
+        text = str(pasted or "").strip()
+        if not text:
+            st.session_state.pop(PRD_REFINEMENT_SESSION_KEY, None)
+            return None
+        transcript = NormalizedTranscript(raw_text=text, source="manual")
+        st.session_state[PRD_REFINEMENT_SESSION_KEY] = transcript
         return transcript
-    return None
 
 
-def _render_requirement_change(change) -> None:
-    """
-    One proposed change, with what it is based on and what it would touch.
-
-    Read-only. The card shows the reviewer everything a decision needs -- the source,
-    the approved wording, the proposed wording, the evidence, and the Jira work linked
-    to that requirement in this session's stored mappings -- and offers no control that
-    could act on it. Approving a change is a separate, explicit step.
-    """
-    heading = "{} — {}".format(
-        _CHANGE_HEADINGS.get(change.change_type, change.change_type),
-        change.requirement_id or "new requirement",
+def _render_prd_traceability(prd: PRDData) -> None:
+    """Which BRD requirements this PRD covers, and which it does not."""
+    covered = prd.covered_requirement_ids
+    st.caption(
+        "Traceability: {} of {} BRD requirement(s) covered — {}".format(
+            len(covered),
+            len(prd.source_requirement_ids),
+            ", ".join(covered) if covered else "none",
+        )
     )
-    with st.expander(heading, expanded=change.change_type != "UNCHANGED"):
+    if prd.uncovered_requirement_ids:
+        st.warning(
+            "Not covered by any feature or journey: {}. Either that is deliberate — "
+            "record it as an open question — or the PRD is incomplete.".format(
+                ", ".join(prd.uncovered_requirement_ids)
+            )
+        )
+
+
+def _prd_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(
+            label,
+            value=_criteria_text(values),
+            key=_PRD_WIDGET_PREFIX + suffix,
+        )
+    )
+
+
+def _render_prd_editor(prd: PRDData) -> PRDData:
+    """
+    The review and edit surface: every edit is kept, and none of them approves anything.
+
+    Requirement ids are shown but not editable. Traceability is derived from the BRD,
+    so letting it be typed over would let a reviewer claim coverage the BRD does not
+    support.
+    """
+    overview = st.text_area(
+        "Product overview",
+        value=prd.overview,
+        key=_PRD_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    goals = _prd_lines("Product goals (one per line)", prd.goals, "goals")
+    metrics = _prd_lines(
+        "Success metrics (one per line)", prd.success_metrics, "success_metrics"
+    )
+    assumptions = _prd_lines(
+        "Product assumptions (one per line)", prd.assumptions, "assumptions"
+    )
+    questions = _prd_lines(
+        "Open questions (one per line)", prd.open_questions, "open_questions"
+    )
+
+    personas = []
+    for position, persona in enumerate(prd.personas, start=1):
+        with st.expander("Persona — {}".format(persona.name)):
+            personas.append(
+                replace(
+                    persona,
+                    description=st.text_area(
+                        "Description",
+                        value=persona.description,
+                        key="{}persona_{}_description".format(_PRD_WIDGET_PREFIX, position),
+                    ),
+                    needs=_prd_lines(
+                        "Needs (one per line)", persona.needs, "persona_{}_needs".format(position)
+                    ),
+                )
+            )
+
+    features = []
+    for feature in prd.features:
+        with st.expander(
+            "{} — {} ({})".format(
+                feature.feature_id, feature.name, ", ".join(feature.requirement_ids)
+            )
+        ):
+            st.caption(
+                "Serves BRD requirement(s): {}".format(", ".join(feature.requirement_ids))
+            )
+            features.append(
+                replace(
+                    feature,
+                    name=st.text_input(
+                        "Feature name",
+                        value=feature.name,
+                        key="{}{}_name".format(_PRD_WIDGET_PREFIX, feature.feature_id),
+                    ),
+                    summary=st.text_area(
+                        "Summary",
+                        value=feature.summary,
+                        key="{}{}_summary".format(_PRD_WIDGET_PREFIX, feature.feature_id),
+                    ),
+                    behaviours=_prd_lines(
+                        "Functional behaviour (one per line)",
+                        feature.behaviours,
+                        "{}_behaviours".format(feature.feature_id),
+                    ),
+                    edge_cases=_prd_lines(
+                        "Edge cases (one per line)",
+                        feature.edge_cases,
+                        "{}_edge_cases".format(feature.feature_id),
+                    ),
+                    acceptance_criteria=_prd_lines(
+                        "Acceptance criteria (one per line)",
+                        feature.acceptance_criteria,
+                        "{}_criteria".format(feature.feature_id),
+                    ),
+                )
+            )
+
+    journeys = []
+    for position, journey in enumerate(prd.journeys, start=1):
+        with st.expander(
+            "Journey — {}{}".format(
+                journey.name, " ({})".format(journey.persona) if journey.persona else ""
+            )
+        ):
+            if journey.requirement_ids:
+                st.caption(
+                    "Serves BRD requirement(s): {}".format(", ".join(journey.requirement_ids))
+                )
+            journeys.append(
+                replace(
+                    journey,
+                    steps=_prd_lines(
+                        "Steps, in order (one per line)",
+                        journey.steps,
+                        "journey_{}_steps".format(position),
+                    ),
+                )
+            )
+
+    edited = replace(
+        prd,
+        overview=overview,
+        goals=goals,
+        success_metrics=metrics,
+        assumptions=assumptions,
+        open_questions=questions,
+        personas=tuple(personas),
+        features=tuple(features),
+        journeys=tuple(journeys),
+    )
+    if edited != prd:
+        # Editing keeps the PRD pending review. Only the approval button approves it.
+        return _persist_prd(edited)
+    return prd
+
+
+def _render_prd_readonly(prd: PRDData) -> None:
+    """The approved PRD, shown rather than offered for editing."""
+    if prd.overview:
+        st.markdown(prd.overview)
+    for heading, values in (
+        ("Goals", prd.goals),
+        ("Success metrics", prd.success_metrics),
+        ("Assumptions", prd.assumptions),
+        ("Open questions", prd.open_questions),
+    ):
+        if values:
+            st.markdown("**{}**".format(heading))
+            for value in values:
+                st.markdown("- {}".format(value))
+    for persona in prd.personas:
+        st.markdown("**Persona — {}** {}".format(persona.name, persona.description))
+    for feature in prd.features:
         st.markdown(
-            "**Source:** {}{}".format(
-                change.source_label,
-                " — {}".format(change.source_reference) if change.source_reference else "",
+            "**{} {}** — serves {}".format(
+                feature.feature_id, feature.name, ", ".join(feature.requirement_ids)
             )
         )
+        for label, values in (
+            ("Behaviour", feature.behaviours),
+            ("Edge cases", feature.edge_cases),
+            ("Acceptance criteria", feature.acceptance_criteria),
+        ):
+            for value in values:
+                st.markdown("- _{}_: {}".format(label, value))
+    for journey in prd.journeys:
+        st.markdown("**Journey — {}**".format(journey.name))
+        for step in journey.steps:
+            st.markdown("- {}".format(step))
 
-        if change.old_text:
-            st.markdown("**Approved requirement (old):** {}".format(change.old_text))
-        elif change.change_type == "NEW":
-            st.caption(
-                "Not in the approved BRD. The id above is proposed for it, not one the "
-                "detector chose."
+
+def _render_prd_stage(lifecycle) -> None:
+    """
+    The PRD stage: generate from the approved BRD, review, edit, then approve explicitly.
+
+    Blocked safely when there is no BRD or the BRD is not approved: the stage says what
+    is missing instead of offering a control that would have to invent requirements.
+    """
+    if lifecycle.brd is None:
+        st.info(
+            "No BRD in this session yet. Generate one at the top of this page; the PRD "
+            "is derived from the approved BRD."
+        )
+        return
+    if not _brd_approved():
+        st.info(
+            "The BRD is pending review. Open the Discovery → BRD stage and approve it to "
+            "generate a PRD from it."
+        )
+        return
+
+    refinement = _prd_refinement()
+    prd = _held_prd()
+
+    if st.button("Generate PRD from the approved BRD", key="generate_prd"):
+        _clear_prd_widgets()
+        st.session_state.pop(PRD_APPROVED_SESSION_KEY, None)
+        # A new PRD invalidates the architecture designed against the previous one.
+        _clear_architecture_state()
+        with st.spinner("Deriving the product definition from the approved BRD..."):
+            prd = _persist_prd(
+                generate_prd(lifecycle.brd, refinement, generate=_planner_generate())
             )
 
-        if change.proposed_new_text:
-            st.markdown("**Proposed requirement (new):** {}".format(change.proposed_new_text))
-
-        if change.is_from_jira:
-            if change.jira_field:
-                st.markdown("**Changed Jira field(s):** {}".format(change.jira_field))
-            if change.previous_value:
-                st.markdown("**Jira value before:**\n```text\n{}\n```".format(change.previous_value))
-            if change.jira_current_value:
-                st.markdown("**Current Jira value:**\n```text\n{}\n```".format(change.jira_current_value))
-
-        if change.source_evidence:
-            st.markdown("**Source Evidence:**\n> {}".format(change.source_evidence))
-        else:
-            st.caption(
-                "No evidence from this source could be verified for this change, so "
-                "none is shown."
-            )
-
-        if change.affected_issue_keys:
-            st.markdown(
-                "**Affected Jira issue(s):** "
-                + ", ".join("`{}`".format(key) for key in change.affected_issue_keys)
-            )
-        if change.affected_plan_keys:
-            st.markdown(
-                "**Affected planned item(s):** "
-                + ", ".join("`{}`".format(key) for key in change.affected_plan_keys)
-            )
-        if not (change.affected_issue_keys or change.affected_plan_keys):
-            st.caption(
-                "No planned or created Jira work is linked to this requirement in this "
-                "session's stored mappings."
-            )
-
-        if change.impact:
-            st.markdown("**Impact:** {}".format(change.impact))
-        if change.proposed_action:
-            st.markdown("**Proposed action:** {}".format(change.proposed_action))
-        if change.confidence:
-            st.caption("Detector confidence: {}".format(change.confidence))
-
-        if change.needs_manual_review:
-            st.warning(
-                change.review_reason
-                or "This change could not be classified confidently and needs a person."
-            )
-
+    if prd is None:
         st.caption(
-            "Status: {}. Nothing in the BRD or in Jira has been changed.".format(
-                change.approval_state
+            "Not generated yet. This derives product overview, personas, features, "
+            "journeys, behaviour, edge cases and acceptance criteria from the approved "
+            "BRD. It creates nothing outside this session."
+        )
+        return
+
+    for note in prd.notes:
+        st.warning(note)
+
+    if prd.is_empty:
+        st.caption(
+            "No PRD content could be derived. Nothing has been approved and nothing "
+            "downstream was generated."
+        )
+        return
+
+    if prd.refinement_source:
+        st.caption(
+            "A product-refinement discussion ({}) was supplied alongside the BRD.".format(
+                prd.refinement_source
             )
         )
+    _render_prd_traceability(prd)
+
+    if bool(st.session_state.get(PRD_APPROVED_SESSION_KEY)):
+        st.success("This PRD is approved.")
+        _render_prd_readonly(prd)
+        if st.button("Revoke PRD approval to edit", key="revoke_prd_approval"):
+            st.session_state[PRD_APPROVED_SESSION_KEY] = False
+        return
+
+    prd = _render_prd_editor(prd)
+    st.caption(
+        "Approving records that you reviewed this PRD. Later stages -- architecture, "
+        "implementation plan, sprints and tests -- are not implemented yet, so nothing "
+        "downstream is generated."
+    )
+    if st.button("Approve PRD", key="approve_prd"):
+        st.session_state[PRD_APPROVED_SESSION_KEY] = True
+        _flash("success", "PRD approved. The architecture can now be generated from it.")
 
 
-def _record_change_decision(changes_key: str, proposal: ChangeProposal, change_id: str, state: str) -> None:
-    """Persist a reviewer decision; this records no BRD or Jira mutation."""
-    st.session_state[changes_key] = decide_change(proposal, change_id, state)
-    st.rerun()
+def _prd_approved() -> bool:
+    return bool(st.session_state.get(PRD_APPROVED_SESSION_KEY))
 
 
-def _render_change_decisions(proposal: ChangeProposal, changes_key: str, brd_data: BRDData) -> None:
-    """Explicit review and apply controls shared by meeting and Jira proposals."""
-    for change in proposal.changes:
-        if not change.is_pending:
-            continue
+def _held_architecture():
+    architecture = st.session_state.get(ARCHITECTURE_SESSION_KEY)
+    return architecture if isinstance(architecture, ArchitectureData) else None
 
-        if change.is_from_jira:
-            # "Accept Jira → BRD" is the approval for a Jira edit. A second, generically
-            # labelled Approve button would record the identical decision, which on a
-            # governance screen reads as a different one.
-            accept, reject, keep = st.columns(3)
-            if accept.button(
-                "Accept Jira → BRD",
-                key="accept_jira_change_{}".format(change.change_id),
-                disabled=not change.is_decidable,
-            ):
-                _record_change_decision(changes_key, proposal, change.change_id, "approved")
-            if reject.button("Reject", key="reject_change_{}".format(change.change_id)):
-                _record_change_decision(changes_key, proposal, change.change_id, "rejected")
-            if keep.button("Keep Jira only", key="keep_jira_change_{}".format(change.change_id)):
-                _record_change_decision(changes_key, proposal, change.change_id, "jira_only")
-        else:
-            approve, reject = st.columns(2)
-            if approve.button(
-                "Approve", key="approve_change_{}".format(change.change_id), disabled=not change.is_decidable
-            ):
-                _record_change_decision(changes_key, proposal, change.change_id, "approved")
-            if reject.button("Reject", key="reject_change_{}".format(change.change_id)):
-                _record_change_decision(changes_key, proposal, change.change_id, "rejected")
 
-    if proposal.approved and st.button("Apply approved changes to BRD", key="apply_requirement_changes"):
-        updated, applied = apply_approved_changes(brd_data, proposal)
-        if not applied:
-            st.warning(
-                "No change was applied because its approved BRD value is no longer current. "
-                "The BRD and Jira were left unchanged."
+def _persist_architecture(architecture: ArchitectureData) -> ArchitectureData:
+    st.session_state[ARCHITECTURE_SESSION_KEY] = architecture
+    return architecture
+
+
+def _architecture_discussion() -> Optional[NormalizedTranscript]:
+    """
+    The optional architecture or design discussion, if the reviewer supplied one.
+
+    Optional by design: the architecture is derived from the approved PRD, and this only
+    adds technical evidence -- a decision already taken, a constraint already known.
+    """
+    with st.expander("Optional architecture discussion"):
+        st.caption(
+            "Not required. The architecture is generated from the approved PRD; a design "
+            "discussion only adds technical evidence on top of it."
+        )
+        pasted = st.text_area(
+            "Paste an architecture or design discussion (optional)",
+            value="",
+            key=_ARCH_WIDGET_PREFIX + "discussion_text",
+            height=140,
+        )
+        text = str(pasted or "").strip()
+        if not text:
+            st.session_state.pop(ARCHITECTURE_DISCUSSION_SESSION_KEY, None)
+            return None
+        transcript = NormalizedTranscript(raw_text=text, source="manual")
+        st.session_state[ARCHITECTURE_DISCUSSION_SESSION_KEY] = transcript
+        return transcript
+
+
+def _render_architecture_traceability(architecture: ArchitectureData, prd: PRDData) -> None:
+    """Which PRD features this architecture realises, which it does not, and whether it is stale."""
+    covered = architecture.covered_feature_ids
+    st.caption(
+        "Traceability: {} of {} PRD feature(s) realised — {}".format(
+            len(covered),
+            len(architecture.source_feature_ids),
+            ", ".join(covered) if covered else "none",
+        )
+    )
+    if architecture.uncovered_feature_ids:
+        st.warning(
+            "Not realised by any component, decision or flow: {}. Either that is "
+            "deliberate, or the architecture is incomplete.".format(
+                ", ".join(architecture.uncovered_feature_ids)
             )
-            return
-        # Deliberately not _store_brd: this amends the reviewed BRD rather than replacing
-        # it, so the creation results and the synchronization baseline stay valid. They
-        # record what already exists in Jira, which an approved BRD edit does not undo.
-        # The decided proposal stays too, so the approved and rejected outcome survives
-        # the rerun; apply_approved_changes re-checks each stored value before touching it.
-        st.session_state[BRD_SESSION_KEY] = updated
-        _flash("success", "Applied {} approved requirement change(s) to the BRD.".format(len(applied)))
-        st.rerun()
-
-
-def _render_jira_drift_detection(brd_data: BRDData, changes_key: str) -> None:
-    """Read only the saved Jira issue snapshots and turn direct edits into proposals."""
-    baseline = st.session_state.get(_skey(JIRA_STATE_NAME, "change_baseline"))
-    if not isinstance(baseline, dict) or not baseline:
-        st.caption(
-            "No saved Jira synchronization baseline is available in this session. "
-            "Jira edits are not compared without one."
         )
-        return
-
-    service = JiraService()
-    tokens = _connected_tokens(service)
-    site = st.session_state.get(_skey(service.name, "site"))
-    if tokens is None or site is None:
-        st.caption(
-            "Connect Jira and select the saved issue's site before checking for direct edits."
+    current = tuple(feature.feature_id for feature in prd.features)
+    if current != tuple(architecture.source_feature_ids):
+        st.warning(
+            "The PRD's features changed after this architecture was generated. Regenerate "
+            "it so the design matches the approved PRD."
         )
-        return
 
-    issue_keys = tuple(str(key).strip() for key in baseline if str(key).strip())
-    if not issue_keys:
-        st.caption("The saved Jira baseline is malformed, so no issue was checked.")
-        return
 
-    if not st.button("Check Jira for requirement drift", key="detect_jira_drift", type="primary"):
-        return
-
-    current_issues = []
-    failures = []
-    for issue_key in issue_keys:
-        current = _provider_call(
-            service,
-            tokens,
-            lambda token, key=issue_key: service.get_issue_fields(token, site.id, key),
-            "Reading {} from Jira...".format(issue_key),
-        )
-        if isinstance(current, dict):
-            current_issues.append(current)
-        else:
-            failures.append(issue_key)
-
-    st.session_state[changes_key] = detect_jira_changes(
-        brd_data,
-        current_issues,
-        plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
-        created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
-        baseline=baseline,
-        failures=failures,
+def _arch_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(label, value=_criteria_text(values), key=_ARCH_WIDGET_PREFIX + suffix)
     )
 
 
-def _render_requirement_changes_section() -> None:
+def _render_architecture_editor(architecture: ArchitectureData) -> ArchitectureData:
     """
-    Compare a later meeting against the approved BRD. Changes nothing.
+    The review and edit surface: every edit is kept, and none of them approves anything.
 
-    Deliberately holds no Jira service and no token, exactly as the work-plan panel
-    does, so "detecting a change creates nothing" is a property of the code rather than
-    a caption. The plan and the creation results are read out of this session only, to
-    report which work a changed requirement is already linked to.
+    Feature ids are shown but not editable, for the reason the PRD editor does not let
+    requirement ids be typed over: traceability is derived from the artifact upstream, so
+    letting it be rewritten here would let a reviewer claim coverage the PRD does not
+    support.
+    """
+    overview = st.text_area(
+        "Architecture overview",
+        value=architecture.overview,
+        key=_ARCH_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    domains = _arch_lines("Core domains (one per line)", architecture.domains, "domains")
+    auth = _arch_lines(
+        "Authentication and authorization (one per line)",
+        architecture.auth_approach,
+        "auth",
+    )
+    dependencies = _arch_lines(
+        "Technical dependencies (one per line)", architecture.dependencies, "dependencies"
+    )
 
-    Every proposal begins pending. A reviewer can explicitly approve, reject, or keep
-    a Jira edit only; applying is a separate button and never writes back to Jira.
+    components = []
+    for layer in LAYERS:
+        in_layer = architecture.layer(layer)
+        st.markdown("**{}** — {} component(s)".format(LAYER_LABEL[layer], len(in_layer)))
+        for component in in_layer:
+            with st.expander("{} — {}".format(component.component_id, component.name)):
+                st.caption(
+                    "Realises PRD feature(s): {}".format(
+                        ", ".join(component.feature_ids) or "none — cross-cutting"
+                    )
+                )
+                components.append(
+                    replace(
+                        component,
+                        name=st.text_input(
+                            "Component name",
+                            value=component.name,
+                            key="{}{}_name".format(_ARCH_WIDGET_PREFIX, component.component_id),
+                        ),
+                        responsibility=st.text_area(
+                            "Responsibility",
+                            value=component.responsibility,
+                            key="{}{}_responsibility".format(
+                                _ARCH_WIDGET_PREFIX, component.component_id
+                            ),
+                        ),
+                        apis=_arch_lines(
+                            "API boundaries (one per line)",
+                            component.apis,
+                            "{}_apis".format(component.component_id),
+                        ),
+                        data=_arch_lines(
+                            "Data or state owned (one per line)",
+                            component.data,
+                            "{}_data".format(component.component_id),
+                        ),
+                        dependencies=_arch_lines(
+                            "Dependencies (one per line)",
+                            component.dependencies,
+                            "{}_dependencies".format(component.component_id),
+                        ),
+                    )
+                )
+
+    decisions = []
+    for decision in architecture.decisions:
+        with st.expander("{} — {}".format(decision.decision_id, decision.title)):
+            decisions.append(
+                replace(
+                    decision,
+                    choice=st.text_area(
+                        "Choice",
+                        value=decision.choice,
+                        key="{}{}_choice".format(_ARCH_WIDGET_PREFIX, decision.decision_id),
+                    ),
+                    rationale=st.text_area(
+                        "Rationale",
+                        value=decision.rationale,
+                        key="{}{}_rationale".format(_ARCH_WIDGET_PREFIX, decision.decision_id),
+                    ),
+                )
+            )
+
+    flows = []
+    for position, flow in enumerate(architecture.flows, start=1):
+        with st.expander("Flow — {}".format(flow.name)):
+            flows.append(
+                replace(
+                    flow,
+                    steps=_arch_lines(
+                        "Steps, in order (one per line)",
+                        flow.steps,
+                        "flow_{}_steps".format(position),
+                    ),
+                )
+            )
+
+    integrations = []
+    for position, integration in enumerate(architecture.integrations, start=1):
+        with st.expander("Integration — {}".format(integration.name)):
+            integrations.append(
+                replace(
+                    integration,
+                    purpose=st.text_area(
+                        "Purpose",
+                        value=integration.purpose,
+                        key="{}integration_{}_purpose".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                    direction=st.text_input(
+                        "Direction",
+                        value=integration.direction,
+                        key="{}integration_{}_direction".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                )
+            )
+
+    risks = []
+    for position, risk in enumerate(architecture.risks, start=1):
+        with st.expander("Risk — {}".format(risk.statement)):
+            risks.append(
+                replace(
+                    risk,
+                    impact=st.text_area(
+                        "Impact",
+                        value=risk.impact,
+                        key="{}risk_{}_impact".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                    mitigation=st.text_area(
+                        "Mitigation",
+                        value=risk.mitigation,
+                        key="{}risk_{}_mitigation".format(_ARCH_WIDGET_PREFIX, position),
+                    ),
+                )
+            )
+
+    edited = replace(
+        architecture,
+        overview=overview,
+        domains=domains,
+        auth_approach=auth,
+        dependencies=dependencies,
+        components=tuple(components),
+        decisions=tuple(decisions),
+        flows=tuple(flows),
+        integrations=tuple(integrations),
+        risks=tuple(risks),
+    )
+    if edited != architecture:
+        # Editing keeps the architecture pending review. Only the approval button approves it.
+        return _persist_architecture(edited)
+    return architecture
+
+
+def _render_architecture_readonly(architecture: ArchitectureData) -> None:
+    """The approved architecture, shown rather than offered for editing."""
+    if architecture.overview:
+        st.markdown(architecture.overview)
+    for heading, values in (
+        ("Core domains", architecture.domains),
+        ("Authentication and authorization", architecture.auth_approach),
+        ("Technical dependencies", architecture.dependencies),
+    ):
+        if values:
+            st.markdown("**{}**".format(heading))
+            for value in values:
+                st.markdown("- {}".format(value))
+    for layer in LAYERS:
+        in_layer = architecture.layer(layer)
+        if not in_layer:
+            continue
+        st.markdown("**{}**".format(LAYER_LABEL[layer]))
+        for component in in_layer:
+            st.markdown(
+                "- **{} {}** — realises {}: {}".format(
+                    component.component_id,
+                    component.name,
+                    ", ".join(component.feature_ids) or "cross-cutting",
+                    component.responsibility,
+                )
+            )
+            for label, values in (
+                ("API", component.apis),
+                ("Data", component.data),
+                ("Depends on", component.dependencies),
+            ):
+                for value in values:
+                    st.markdown("    - _{}_: {}".format(label, value))
+    for decision in architecture.decisions:
+        st.markdown(
+            "**{} {}** — {} ({})".format(
+                decision.decision_id, decision.title, decision.choice, decision.rationale
+            )
+        )
+    for flow in architecture.flows:
+        st.markdown("**Flow — {}**".format(flow.name))
+        for step in flow.steps:
+            st.markdown("- {}".format(step))
+    for integration in architecture.integrations:
+        st.markdown(
+            "**Integration — {}** {} {}".format(
+                integration.name, integration.direction, integration.purpose
+            )
+        )
+    for risk in architecture.risks:
+        st.markdown(
+            "**Risk — {}** impact: {} mitigation: {}".format(
+                risk.statement, risk.impact, risk.mitigation
+            )
+        )
+
+
+def _render_architecture_stage(lifecycle) -> None:
+    """
+    The architecture stage: generate from the approved PRD, review, edit, approve explicitly.
+
+    Blocked safely when there is no PRD or the PRD is not approved: the stage says what is
+    missing instead of offering a control that would have to invent product scope.
+    """
+    prd = lifecycle.prd
+    if prd is None or prd.is_empty:
+        st.info(
+            "No PRD in this session yet. Open the Product Definition → PRD stage and "
+            "generate one; the architecture is derived from the approved PRD."
+        )
+        return
+    if not _prd_approved() or not _brd_approved():
+        st.info(
+            "The PRD is pending review. Open the Product Definition → PRD stage and "
+            "approve it to generate an architecture from it."
+        )
+        return
+
+    discussion = _architecture_discussion()
+    architecture = _held_architecture()
+
+    if st.button("Generate architecture from the approved PRD", key="generate_architecture"):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_ARCH_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(ARCHITECTURE_APPROVED_SESSION_KEY, None)
+        with st.spinner("Deriving the technical architecture from the approved PRD..."):
+            architecture = _persist_architecture(
+                generate_architecture(prd, discussion, generate=_planner_generate())
+            )
+
+    if architecture is None:
+        st.caption(
+            "Not generated yet. This derives backend, web and mobile components, API "
+            "boundaries, data ownership, authentication, data flows, integrations, "
+            "decisions, dependencies and technical risks from the approved PRD. It "
+            "creates nothing outside this session."
+        )
+        return
+
+    for note in architecture.notes:
+        st.warning(note)
+
+    if architecture.is_empty:
+        st.caption(
+            "No architecture content could be derived. Nothing has been approved and "
+            "nothing downstream was generated."
+        )
+        return
+
+    if architecture.discussion_source:
+        st.caption(
+            "An architecture discussion ({}) was supplied alongside the PRD.".format(
+                architecture.discussion_source
+            )
+        )
+    _render_architecture_traceability(architecture, prd)
+
+    if bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY)):
+        st.success("This architecture is approved.")
+        _render_architecture_readonly(architecture)
+        if st.button("Revoke architecture approval to edit", key="revoke_architecture_approval"):
+            st.session_state[ARCHITECTURE_APPROVED_SESSION_KEY] = False
+        return
+
+    architecture = _render_architecture_editor(architecture)
+    st.caption(
+        "Approving records that you reviewed this architecture, and unlocks the "
+        "Implementation Plan stage. Nothing is created in Jira, and the sprint and test "
+        "stages after it are not implemented yet."
+    )
+    if st.button("Approve architecture", key="approve_architecture"):
+        st.session_state[ARCHITECTURE_APPROVED_SESSION_KEY] = True
+        _flash("success", "Architecture approved.")
+
+
+def _architecture_approved() -> bool:
+    return bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY))
+
+
+def _held_implementation_plan():
+    plan = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    return plan if isinstance(plan, ImplementationPlan) else None
+
+
+def _persist_implementation_plan(plan: ImplementationPlan) -> ImplementationPlan:
+    st.session_state[IMPLEMENTATION_PLAN_SESSION_KEY] = plan
+    _clear_test_cases_state()
+    return plan
+
+
+def _held_test_cases():
+    test_cases = st.session_state.get(TEST_CASES_SESSION_KEY)
+    return test_cases if isinstance(test_cases, (list, tuple)) else None
+
+
+def _persist_test_cases(test_cases) -> list:
+    st.session_state[TEST_CASES_SESSION_KEY] = test_cases
+    return test_cases
+
+
+def _render_plan_traceability(
+    plan: ImplementationPlan, prd: PRDData, architecture: ArchitectureData
+) -> None:
+    """
+    What this plan builds, what it leaves unbuilt, and whether it is stale.
+
+    Two coverage questions, not one: an uncovered PRD feature means the plan does not
+    deliver approved product behaviour, and an uncovered architecture component means the
+    plan does not build a part of the approved design. They fail differently, so they are
+    reported separately.
+    """
+    st.caption(
+        "Traceability: {} of {} PRD feature(s) delivered, {} of {} architecture "
+        "component(s) built — {} epic(s), {} story/stories, {} task(s)".format(
+            len(plan.covered_feature_ids),
+            len(plan.source_feature_ids),
+            len(plan.covered_component_ids),
+            len(plan.source_component_ids),
+            len(plan.epics),
+            len(plan.stories),
+            plan.task_count,
+        )
+    )
+    if plan.uncovered_feature_ids:
+        st.warning(
+            "Not delivered by any story: {}. Either that is deliberate, or the plan is "
+            "incomplete.".format(", ".join(plan.uncovered_feature_ids))
+        )
+    if plan.uncovered_component_ids:
+        st.warning(
+            "Not built by any story or task: {}. The approved design promises these "
+            "components.".format(", ".join(plan.uncovered_component_ids))
+        )
+    unready = plan.unready_stories
+    if unready:
+        st.warning(
+            "{} story/stories are not ready to implement: {}.".format(
+                len(unready),
+                "; ".join(
+                    "{} ({})".format(story.story_id, ", ".join(story.readiness_gaps))
+                    for story in unready[:5]
+                ),
+            )
+        )
+    if tuple(feature.feature_id for feature in prd.features) != tuple(plan.source_feature_ids):
+        st.warning(
+            "The PRD's features changed after this plan was generated. Regenerate it so "
+            "the work matches the approved PRD."
+        )
+    if tuple(
+        component.component_id for component in architecture.components
+    ) != tuple(plan.source_component_ids):
+        st.warning(
+            "The architecture's components changed after this plan was generated. "
+            "Regenerate it so the work matches the approved design."
+        )
+
+
+def _plan_lines(label: str, values, suffix: str) -> tuple:
+    """One editable list of single-line statements."""
+    return _criteria_from_text(
+        st.text_area(label, value=_criteria_text(values), key=_PLAN_WIDGET_PREFIX + suffix)
+    )
+
+
+def _plan_priority(current: str, suffix: str) -> str:
+    """A priority chosen from the vocabulary, so an unorderable value cannot be typed."""
+    options = list(PRIORITIES)
+    index = options.index(current) if current in options else options.index(DEFAULT_PRIORITY)
+    return st.selectbox(
+        "Priority", options, index=index, key=_PLAN_WIDGET_PREFIX + suffix
+    )
+
+
+def _plan_components(current, choices: list, suffix: str) -> tuple:
+    """
+    Architecture components chosen from a list rather than typed.
+
+    Offered as a choice because a component id typed by hand can name a component the
+    approved design does not contain, which is exactly the traceability the generator
+    spends its notes protecting.
+    """
+    if not choices:
+        return tuple(current)
+    selected = st.multiselect(
+        "Architecture components",
+        choices,
+        default=[value for value in current if value in choices],
+        key=_PLAN_WIDGET_PREFIX + suffix,
+    )
+    return tuple(selected)
+
+
+def _render_plan_story_editor(story, component_choices: list, story_choices: list):
+    """One story's editable fields, including its technical tasks."""
+    st.caption(
+        "Delivers PRD feature(s): {} · {}".format(
+            ", ".join(story.feature_ids) or "none",
+            "ready to implement" if story.is_ready else "not ready: " + ", ".join(story.readiness_gaps),
+        )
+    )
+    title = st.text_input(
+        "Story title", value=story.title, key="{}{}_title".format(_PLAN_WIDGET_PREFIX, story.story_id)
+    )
+    user_story = st.text_area(
+        "User story",
+        value=story.user_story,
+        key="{}{}_user_story".format(_PLAN_WIDGET_PREFIX, story.story_id),
+        help="As a <role>, I want <capability> so that <benefit>.",
+    )
+    criteria = _plan_lines(
+        "Acceptance criteria (one per line)",
+        story.acceptance_criteria,
+        "{}_criteria".format(story.story_id),
+    )
+    priority = _plan_priority(story.priority, "{}_priority".format(story.story_id))
+    components = _plan_components(
+        story.component_ids, component_choices, "{}_components".format(story.story_id)
+    )
+    others = [value for value in story_choices if value != story.story_id]
+    depends_on = tuple(
+        st.multiselect(
+            "Depends on (stories that must be delivered first)",
+            others,
+            default=[value for value in story.depends_on if value in others],
+            key="{}{}_depends".format(_PLAN_WIDGET_PREFIX, story.story_id),
+        )
+    )
+    expectations = _plan_lines(
+        "Test expectations (one per line)",
+        story.test_expectations,
+        "{}_tests".format(story.story_id),
+    )
+    estimate = st.text_input(
+        "Estimate",
+        value=story.estimate,
+        key="{}{}_estimate".format(_PLAN_WIDGET_PREFIX, story.story_id),
+    )
+
+    tasks = []
+    for task in story.tasks:
+        st.markdown("**{} — {}**".format(task.label, task.task_id))
+        tasks.append(
+            replace(
+                task,
+                title=st.text_input(
+                    "Task title",
+                    value=task.title,
+                    key="{}{}_title".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+                detail=st.text_area(
+                    "Task detail",
+                    value=task.detail,
+                    key="{}{}_detail".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+                component_ids=_plan_components(
+                    task.component_ids, component_choices, "{}_components".format(task.task_id)
+                ),
+                estimate=st.text_input(
+                    "Task estimate",
+                    value=task.estimate,
+                    key="{}{}_estimate".format(_PLAN_WIDGET_PREFIX, task.task_id),
+                ),
+            )
+        )
+
+    return replace(
+        story,
+        title=title,
+        user_story=user_story,
+        acceptance_criteria=criteria,
+        priority=priority,
+        component_ids=components,
+        depends_on=depends_on,
+        test_expectations=expectations,
+        estimate=estimate,
+        tasks=tuple(tasks),
+    )
+
+
+def _render_plan_editor(
+    plan: ImplementationPlan, architecture: ArchitectureData
+) -> ImplementationPlan:
+    """
+    The review and edit surface: every edit is kept, and none of them approves anything.
+
+    Feature ids are shown but not editable, for the reason the architecture editor does not
+    let feature ids be typed over: traceability is derived from the artifact upstream, so
+    letting it be rewritten here would let a reviewer claim coverage the PRD does not
+    support. Component ids and dependencies *are* editable, because those are engineering
+    decisions -- but they are chosen from a list, so neither can name something that does
+    not exist.
+    """
+    overview = st.text_area(
+        "Plan overview and sequencing",
+        value=plan.overview,
+        key=_PLAN_WIDGET_PREFIX + "overview",
+        height=120,
+    )
+    component_choices = list(plan.source_component_ids) or list(
+        component_index(architecture).keys()
+    )
+    story_choices = [story.story_id for story in plan.stories]
+
+    epics = []
+    stories: list = []
+    edited_story_ids: set = set()
+    for epic in plan.epics:
+        under = plan.stories_for(epic.epic_id)
+        with st.expander(
+            "{} — {} ({} story/stories)".format(epic.epic_id, epic.name, len(under)),
+            expanded=False,
+        ):
+            st.caption(
+                "Delivers PRD feature(s): {}".format(", ".join(epic.feature_ids) or "none")
+            )
+            epics.append(
+                replace(
+                    epic,
+                    name=st.text_input(
+                        "Epic name",
+                        value=epic.name,
+                        key="{}{}_name".format(_PLAN_WIDGET_PREFIX, epic.epic_id),
+                    ),
+                    goal=st.text_area(
+                        "Epic goal",
+                        value=epic.goal,
+                        key="{}{}_goal".format(_PLAN_WIDGET_PREFIX, epic.epic_id),
+                    ),
+                    priority=_plan_priority(
+                        epic.priority, "{}_priority".format(epic.epic_id)
+                    ),
+                )
+            )
+            for story in under:
+                st.markdown("---")
+                st.markdown("**{} — {}**".format(story.story_id, story.title))
+                stories.append(
+                    _render_plan_story_editor(story, component_choices, story_choices)
+                )
+                edited_story_ids.add(story.story_id)
+
+    orphans = tuple(story for story in plan.stories if story.story_id not in edited_story_ids)
+    if orphans:
+        st.markdown("**Stories under no epic**")
+        for story in orphans:
+            with st.expander("{} — {}".format(story.story_id, story.title), expanded=False):
+                stories.append(
+                    _render_plan_story_editor(story, component_choices, story_choices)
+                )
+
+    # Plan order, not editor order: the editor walks epics first and orphans last, and
+    # reordering the plan as a side effect of rendering it would change what is approved.
+    by_id = {story.story_id: story for story in stories}
+    ordered = [by_id.get(story.story_id, story) for story in plan.stories]
+    repaired, dropped = break_dependency_cycles(ordered)
+    if dropped:
+        st.warning(
+            "Those dependencies would make the work unstartable, so the closing link was "
+            "removed: {}.".format(", ".join(dropped))
+        )
+
+    edited = replace(plan, overview=overview, epics=tuple(epics), stories=tuple(repaired))
+    if edited != plan:
+        # Editing keeps the plan pending review. Only the approval button approves it.
+        return _persist_implementation_plan(edited)
+    return plan
+
+
+def _render_plan_readonly(plan: ImplementationPlan) -> None:
+    """The approved plan, shown rather than offered for editing."""
+    if plan.overview:
+        st.markdown(plan.overview)
+
+    def show_story(story) -> None:
+        st.markdown(
+            "- **{} {}** [{}] — delivers {}{}".format(
+                story.story_id,
+                story.title,
+                story.priority,
+                ", ".join(story.feature_ids) or "nothing traced",
+                " · after {}".format(", ".join(story.depends_on)) if story.depends_on else "",
+            )
+        )
+        if story.user_story:
+            st.markdown("    - _{}_".format(story.user_story))
+        for criterion in story.acceptance_criteria:
+            st.markdown("    - _Accepts_: {}".format(criterion))
+        for task in story.tasks:
+            st.markdown(
+                "    - _{}_ {} — {}{}".format(
+                    task.label,
+                    task.task_id,
+                    task.title,
+                    " ({})".format(", ".join(task.component_ids)) if task.component_ids else "",
+                )
+            )
+        for expectation in story.test_expectations:
+            st.markdown("    - _Tests_: {}".format(expectation))
+
+    for epic in plan.epics:
+        st.markdown(
+            "**{} {}** [{}] — {}".format(epic.epic_id, epic.name, epic.priority, epic.goal)
+        )
+        for story in plan.stories_for(epic.epic_id):
+            show_story(story)
+    orphans = plan.orphan_stories
+    if orphans:
+        st.markdown("**Stories under no epic**")
+        for story in orphans:
+            show_story(story)
+
+    order = plan.ordered_story_ids
+    if order:
+        st.caption("Dependency order: {}".format(" → ".join(order)))
+
+
+def _render_test_case_traceability(test_cases: list[TestSuite], plan: ImplementationPlan) -> None:
+    """Show traceability from test cases back to stories and requirements."""
+    if not test_cases:
+        st.caption("No test cases to show traceability for.")
+        return
+
+    # Group test cases by story reference
+    test_cases_by_story = {}
+    for suite in test_cases:
+        for tc in suite.test_cases:
+            story_ref = tc.story_reference
+            if story_ref not in test_cases_by_story:
+                test_cases_by_story[story_ref] = []
+            test_cases_by_story[story_ref].append(tc)
+
+    st.caption(
+        f"Traceability: {sum(len(suite.test_cases) for suite in test_cases)} test case(s) covering "
+        f"{len(test_cases_by_story)} story(s) from the implementation plan."
+    )
+
+    # Show which stories have test cases
+    story_ids_with_tests = set(test_cases_by_story.keys())
+    all_story_ids = {story.story_id for story in plan.stories}
+    stories_without_tests = all_story_ids - story_ids_with_tests
+
+    if stories_without_tests:
+        st.warning(
+            "No test cases generated for story(s): {}. Either that is deliberate — "
+            "record it as an open question — or test case generation is incomplete.".format(
+                ", ".join(sorted(stories_without_tests))
+            )
+        )
+
+
+def _render_test_case_readonly(test_cases: list[TestSuite]) -> None:
+    """The approved test cases, shown rather than offered for editing."""
+    if not test_cases:
+        st.caption("No test cases available.")
+        return
+
+    for suite in test_cases:
+        st.markdown("**Test Suite for Story {}**".format(suite.story_id))
+        for test_case in suite.test_cases:
+            st.markdown(
+                "- **{}** [{}] — {}".format(
+                    test_case.test_id,
+                    test_case.priority,
+                    test_case.scenario,
+                )
+            )
+            if test_case.preconditions:
+                st.markdown("    - _Preconditions_: {}".format(test_case.preconditions))
+            if test_case.steps:
+                st.markdown("    - _Steps_: {}".format(test_case.steps))
+            if test_case.expected_result:
+                st.markdown("    - _Expected Result_: {}".format(test_case.expected_result))
+            st.markdown("    - _Type_: {}".format(test_case.test_type))
+
+    st.caption("These test cases are approved and ready for execution.")
+
+
+def _render_test_case_editor(test_cases: list[TestSuite]) -> list[TestSuite]:
+    """Review and edit surface for test cases: every edit is kept, and none of them approves anything.
+
+    Test IDs are shown but not editable to preserve traceability.
+    Story reference is shown but not editable to preserve traceability.
+    """
+    if not test_cases:
+        st.caption("No test cases to edit.")
+        return test_cases
+
+    edited_suites = []
+    for suite_idx, suite in enumerate(test_cases):
+        with st.expander(f"Test Suite for Story {suite.story_id}", expanded=True):
+            edited_test_cases = []
+            for tc_idx, test_case in enumerate(suite.test_cases):
+                with st.container(border=True):
+                    st.markdown(f"**Test Case {tc_idx + 1}**")
+                    st.caption(f"*Test ID:* `{test_case.test_id}` (read-only for traceability)")
+                    st.caption(f"*Story Reference:* `{test_case.story_reference}` (read-only for traceability)")
+
+                    scenario = st.text_area(
+                        "Scenario",
+                        value=test_case.scenario,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_scenario",
+                        height=68,
+                    )
+
+                    preconditions = st.text_area(
+                        "Preconditions",
+                        value=test_case.preconditions,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_preconditions",
+                        height=68,
+                    )
+
+                    steps = st.text_area(
+                        "Steps",
+                        value=test_case.steps,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_steps",
+                        height=68,
+                    )
+
+                    expected_result = st.text_area(
+                        "Expected Result",
+                        value=test_case.expected_result,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_expected_result",
+                        height=68,
+                    )
+
+                    # Priority selector
+                    priority_options = ["High", "Medium", "Low"]
+                    try:
+                        priority_index = priority_options.index(test_case.priority)
+                    except ValueError:
+                        priority_index = 1  # Default to Medium
+
+                    priority = st.selectbox(
+                        "Priority",
+                        options=priority_options,
+                        index=priority_index,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_priority",
+                    )
+
+                    # Test type selector
+                    test_type_options = ["Functional", "Negative", "Edge Case", "Integration", "Security"]
+                    try:
+                        test_type_index = test_type_options.index(test_case.test_type)
+                    except ValueError:
+                        test_type_index = 0  # Default to Functional
+
+                    test_type = st.selectbox(
+                        "Test Type",
+                        options=test_type_options,
+                        index=test_type_index,
+                        key=f"{_TEST_CASES_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_test_type",
+                    )
+
+                    # Create updated test case
+                    updated_test_case = TestCase(
+                        test_id=test_case.test_id,
+                        story_reference=test_case.story_reference,
+                        scenario=scenario,
+                        preconditions=preconditions,
+                        steps=steps,
+                        expected_result=expected_result,
+                        priority=priority,
+                        test_type=test_type,
+                        is_approved=test_case.is_approved  # Preserve approval status
+                    )
+                    edited_test_cases.append(updated_test_case)
+
+            # Create updated suite
+            edited_suite = TestSuite(
+                story_id=suite.story_id,
+                test_cases=edited_test_cases
+            )
+            edited_suites.append(edited_suite)
+
+    return edited_suites
+
+
+def _render_implementation_plan_stage(lifecycle) -> None:
+    """
+    The implementation plan stage: generate from the approved PRD and architecture, review,
+    edit, approve explicitly.
+
+    Blocked safely when either upstream artifact is missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent scope or invent
+    a system. Nothing here writes to Jira -- turning an approved plan into issues is the
+    delivery stage's job, and doing it here would create work nobody had reviewed.
+    """
+    prd = lifecycle.prd
+    architecture = lifecycle.architecture
+    if architecture is None or architecture.is_empty:
+        st.info(
+            "No architecture in this session yet. Open the Architecture stage and generate "
+            "one; the implementation plan is derived from the approved PRD and architecture."
+        )
+        return
+    if not (_architecture_approved() and _prd_approved() and _brd_approved()):
+        st.info(
+            "The architecture is pending review. Open the Architecture stage and approve "
+            "it to generate an implementation plan from it."
+        )
+        return
+
+    plan = _held_implementation_plan()
+
+    if st.button(
+        "Generate implementation plan from the approved PRD and architecture",
+        key="generate_implementation_plan",
+    ):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_PLAN_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY, None)
+        with st.spinner("Decomposing the approved design into epics, stories and tasks..."):
+            plan = _persist_implementation_plan(
+                generate_implementation_plan(prd, architecture, generate=_planner_generate())
+            )
+
+    if plan is None:
+        st.caption(
+            "Not generated yet. This decomposes the approved PRD and architecture into "
+            "epics, stories with acceptance criteria, and the technical tasks that build "
+            "them, with priorities and dependency order. It creates nothing in Jira and "
+            "nothing outside this session."
+        )
+        return
+
+    for note in plan.notes:
+        st.warning(note)
+
+    if plan.is_empty:
+        st.caption(
+            "No plan content could be derived. Nothing has been approved and nothing "
+            "downstream was generated."
+        )
+        return
+
+    _render_plan_traceability(plan, prd, architecture)
+
+    if bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.success("This implementation plan is approved.")
+
+        # --- AI Coding Agent Capability (when implementation plan and test cases are approved) ---
+        if lifecycle.state("test_cases").status == "Approved":
+            _render_coding_agent_capability(lifecycle)
+        else:
+            st.info(
+                "Generate and approve test cases to enable the AI Coding Agent."
+            )
+
+        _render_plan_readonly(plan)
+        if st.button(
+            "Revoke implementation plan approval to edit", key="revoke_plan_approval"
+        ):
+            st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = False
+        return
+
+    # --- Test Execution Capability ---
+    if bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)) and lifecycle.state("implementation_plan").status == "Approved":
+        _render_test_execution_capability(lifecycle)
+
+    plan = _render_plan_editor(plan, architecture)
+    st.caption(
+        "Approving records that you reviewed this plan. Nothing is created in Jira: the "
+        "delivery stage is what turns an approved plan into issues, and the sprint and "
+        "test stages after it are not implemented yet."
+    )
+    if st.button("Approve implementation plan", key="approve_implementation_plan"):
+        st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = True
+        _flash("success", "Implementation plan approved.")
+
+
+def _render_coding_agent_capability(lifecycle) -> None:
+    """
+    AI Coding Agent capability: implements approved stories end-to-end.
+    """
+    st.markdown("#### AI Coding Agent")
+
+    if lifecycle.state("implementation_plan").status != "Approved":
+        st.info("Generate and approve an implementation plan to enable the AI Coding Agent.")
+        return
+
+    if lifecycle.state("test_cases").status != "Approved":
+        st.info("Generate and approve test cases to enable AI Coding Agent verification.")
+        return
+
+    plan = lifecycle.implementation_plan
+    if not plan or plan.is_empty:
+        st.info("No implementation plan available.")
+        return
+
+    st.markdown("**Select Story to Implement**")
+    story_options = {f"{story.story_id}: {story.title}": story for story in plan.stories}
+
+    if not story_options:
+        st.info("No stories found in implementation plan.")
+        return
+
+    selected_story_label = st.selectbox(
+        "Choose a story from the approved implementation plan:",
+        options=list(story_options.keys()),
+        key="coding_agent_story_select"
+    )
+
+    selected_story = story_options.get(selected_story_label)
+    if not selected_story:
+        return
+
+    with st.expander("Story Details", expanded=False):
+        st.markdown(f"**ID:** {selected_story.story_id}")
+        st.markdown(f"**Title:** {selected_story.title}")
+        st.markdown(f"**User Story:** {selected_story.user_story}")
+        st.markdown("**Acceptance Criteria:**")
+        for criterion in selected_story.acceptance_criteria:
+            st.markdown(f"- {criterion}")
+        if selected_story.tasks:
+            st.markdown("**Technical Tasks:**")
+            for task in selected_story.tasks:
+                st.markdown(f"- {task.title}")
+
+    if st.button("Run AI Coding Agent", key="run_coding_agent"):
+        with st.spinner("Running AI Coding Agent..."):
+            from coding_agent import run_ai_coding_agent
+            result = run_ai_coding_agent(selected_story)
+            st.session_state.coding_agent_result = result
+            st.session_state.coding_agent_story_id = selected_story.story_id
+
+    if 'coding_agent_result' in st.session_state and st.session_state.coding_agent_story_id == selected_story.story_id:
+        result = st.session_state.coding_agent_result
+        st.markdown("### Execution Results")
+        if result.blocked:
+            st.error(f"**Blocked:** {result.blocked_reason}")
+        else:
+            st.success("**Execution Completed**")
+
+        if result.files_changed:
+            st.markdown("**Files Changed:**")
+            for change in result.files_changed:
+                if change.change_type == "created":
+                    st.markdown(f"- ✅ **{change.file_path}** (created)")
+                else:
+                    st.markdown(f"- 🔄 **{change.file_path}** (modified)")
+        else:
+            st.markdown("**Files Changed:** None")
+
+        if result.fix_attempts > 0:
+            st.markdown(f"**Fix Attempts:** {result.fix_attempts}")
+
+        if result.test_suites:
+            st.markdown("**Test Results:**")
+            for suite in result.test_suites:
+                for tc in suite.test_cases:
+                    st.markdown(f"- **{tc.test_id}**: {tc.scenario} ({tc.execution_status})")
+        else:
+            st.markdown("**Test Results:** None")
+
+        if result.evidence_generated:
+            st.info("✅ Evidence generated for traceability")
+        else:
+            st.warning("⚠️ No evidence generated")
+
+
+def _render_plan_delivery_status(lifecycle) -> None:
+    """
+    What the approved implementation plan became in Jira, read-only.
+
+    Reads session state and nothing else: no token, no request, so opening this stage
+    cannot create, change or re-read anything. Status here means *delivery creation*
+    status, which is a fact this app recorded when it created the issues. It is not an
+    issue's Jira workflow status: this app has no read-issue endpoint, and the per-issue
+    read that once existed was removed along with the requirement-drift feature it
+    served. Saying "In Progress" would otherwise imply a workflow read that never
+    happened.
+    """
+    mapping = st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping"))
+    if not isinstance(mapping, DeliveryMapping) or mapping.is_empty:
+        st.caption(
+            "No implementation-plan item has been created in Jira yet, so there is no "
+            "delivery mapping to show."
+        )
+        return
+
+    st.markdown(
+        "**{}** implementation-plan item(s) created in **{}**.".format(
+            mapping.created_count, mapping.project_label or mapping.project_identifier
+        )
+    )
+    _render_delivery_mapping(mapping, mapping.site_url)
+    st.caption(
+        "Recorded when each issue was created. Nothing in Jira changes the plan, the "
+        "architecture, the PRD or the BRD — the trail runs one way."
+    )
+
+
+def _render_sprint_completion_capability(lifecycle) -> None:
+    """
+    Sprint Completion capability: evaluate the current sprint using implementation,
+    review, and test evidence; propose next sprint; preserve history.
+    This capability lives inside the Delivery Status area and is not a separate
+    lifecycle stage.
+    """
+    # Need approved implementation plan and test cases to evaluate a sprint
+    plan = lifecycle.implementation_plan
+    if plan is None or getattr(plan, "is_empty", True):
+        st.info(
+            "Generate and approve an implementation plan to use sprint completion."
+        )
+        return
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.info(
+            "The implementation plan is pending review. Approve it to enable sprint completion."
+        )
+        return
+    test_cases = _held_test_cases()
+    if test_cases is None:
+        st.info(
+            "Generate test cases to enable sprint completion evidence evaluation."
+        )
+        return
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info(
+            "The test cases are pending review. Approve them to enable sprint completion."
+        )
+        return
+
+    # Find the most recent sprint plan in delivery mapping (if any) or session
+    mapping = st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping"))
+    if mapping is None or mapping.is_empty:
+        st.info(
+            "Create Jira issues from the implementation plan to enable sprint completion."
+        )
+        return
+
+    # For simplicity, we assume the delivery mapping contains the current sprint's issues.
+    # In a fuller implementation, we would have a selected sprint plan stored in session.
+    # Here we reuse the existing sprint recommendation logic to get a plan from the mapping.
+    from sprint_generator import recommend_sprint
+    sprint_plan = recommend_sprint(mapping)
+    if sprint_plan is None or getattr(sprint_plan, "is_empty", True):
+        st.info(
+            "The delivery mapping contains no issues; cannot evaluate sprint completion."
+        )
+        return
+
+    # Evaluate sprint completion using the evidence we have
+    sprint_completion = complete_sprint(
+        lifecycle, sprint_plan, test_cases=test_cases
+    )
+
+    # Display completion results
+    st.markdown("### Sprint Completion")
+    st.markdown(f"**Sprint:** {sprint_plan.sprint_name}")
+    st.markdown(f"**Goal:** {sprint_plan.sprint_goal}")
+    st.markdown(f"**Status:** {sprint_completion.overall_status}")
+    if sprint_completion.approved:
+        st.success("✅ Sprint completion approved by reviewer")
+    else:
+        st.warning("⏳ Sprint completion pending reviewer approval")
+
+    # Show per-story completion
+    completed_count = sum(
+        1 for sc in sprint_completion.story_completions if sc.is_completed
+    )
+    total_stories = len(sprint_completion.story_completions)
+    st.caption(
+        f"{completed_count}/{total_stories} stories complete "
+        f"({sprint_completion.overall_status.lower()})"
+    )
+
+    with st.expander("Story completion details"):
+        for sc in sprint_completion.story_completions:
+            status = "✅ Done" if sc.is_completed else "❌ Not done"
+            st.markdown(
+                f"- **{sc.story_id or '(no story id)'}**: {status} — {sc.detail}"
+            )
+
+    # Show remaining backlog (unfinished stories carried forward)
+    if sprint_completion.remaining_backlog:
+        st.markdown("### Remaining Backlog")
+        st.caption(
+            "These stories were not completed and will be carried into the next sprint."
+        )
+        for issue in sprint_completion.remaining_backlog:
+            st.markdown(
+                f"- **{issue.issue_key}**: {issue.summary}"
+                f"  \n  *{issue.rationale}*"
+            )
+
+    # Show next sprint recommendation
+    next_sprint = recommend_next_sprint(lifecycle, sprint_completion)
+    st.markdown("### Next Sprint Recommendation")
+    st.markdown(f"**Sprint:** {next_sprint.sprint_name}")
+    st.markdown(f"**Goal:** {next_sprint.sprint_goal}")
+    st.markdown(f"**Duration:** {next_sprint.duration_weeks} weeks")
+
+    # Approval controls for the next sprint
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(
+            "Approve Next Sprint",
+            key="sprint_completion_approve_next",
+            disabled=sprint_completion.approved,
+        ):
+            # Mark the next sprint as approved (store in session)
+            st.session_state[SPRINT_COMPLETION_NEXT_KEY] = next_sprint
+            st.session_state[SPRINT_COMPLETION_APPROVED_KEY] = True
+            st.success("Next sprint approved")
+            st.rerun()
+    with col2:
+        if st.button(
+            "Save Sprint Completion",
+            key="sprint_completion_save",
+            disabled=sprint_completion.approved,
+        ):
+            # Save this sprint completion to history
+            history = st.session_state.get(SPRINT_COMPLETION_HISTORY_KEY, [])
+            history.append(sprint_completion)
+            st.session_state[SPRINT_COMPLETION_HISTORY_KEY] = history
+            st.session_state[SPRINT_COMPLETION_LAST_KEY] = sprint_completion
+            st.success("Sprint completion saved to history")
+            st.rerun()
+
+    # Show history of saved sprint completions
+    history = st.session_state.get(SPRINT_COMPLETION_HISTORY_KEY, [])
+    if history:
+        st.markdown("### Sprint Completion History")
+        st.caption(f"Saved completions: {len(history)}")
+        for i, sc in enumerate(reversed(history)):
+            with st.expander(
+                f"{sc.sprint_plan.sprint_name} — {sc.overall_status} "
+                f"({'✅ Approved' if sc.approved else '⏳ Pending'})"
+            ):
+                st.markdown(f"**Goal:** {sc.sprint_plan.sprint_goal}")
+                completed = sum(
+                    1 for s in sc.story_completions if s.is_completed
+                )
+                total = len(sc.story_completions)
+                st.caption(f"{completed}/{total} stories complete")
+                if not sc.approved:
+                    st.caption("⏳ Pending reviewer approval")
+
+
+def _render_test_execution_capability(lifecycle) -> None:
+    """
+    Test Execution Capability: Execute approved test cases and collect execution evidence.
+
+    This capability executes repository tests for approved test cases, captures
+    execution evidence, and requires human approval before this evidence is
+    consumed by Sprint Completion.
+
+    Execution mapping:
+    - exit code 0 → Pass
+    - non-zero test failure → Fail
+    - unable/unexecutable → Blocked/Not Run with clear reason
+    - no executable mapping → Not Run
+
+    Safety:
+    - workspace confinement, timeout, safe subprocess
+    - no arbitrary path traversal
+    - evidence captured with test IDs and story references
+    - human approval required before delivery evidence
+    """
+    st.markdown("### Test Execution & Delivery Evidence")
+
+    # Need approved test cases and implementation plan
+    test_cases = _held_test_cases()
+    if not test_cases:
+        st.info("Generate and approve test cases to enable test execution.")
+        return
+
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info("The test cases are pending review. Approve them to enable test execution.")
+        return
+
+    if lifecycle.state("implementation_plan").status != "Approved":
+        st.info("Generate and approve an implementation plan to enable test execution.")
+        return
+
+    # Get the implementation plan
+    plan = lifecycle.implementation_plan
+    if not plan or plan.is_empty:
+        st.info("No implementation plan available.")
+        return
+
+    st.caption("Execution evidence is required for Sprint Completion to determine story completion.")
+
+    # Select story to execute
+    story_options = {f"{story.story_id}: {story.title}": story for story in plan.stories}
+
+    if not story_options:
+        st.info("No stories found in implementation plan.")
+        return
+
+    selected_story_label = st.selectbox(
+        "Choose a story to execute:",
+        options=list(story_options.keys()),
+        key="test_execution_story_select"
+    )
+
+    selected_story = story_options.get(selected_story_label)
+    if not selected_story:
+        return
+
+    with st.expander("Story Details", expanded=False):
+        st.markdown(f"**ID:** {selected_story.story_id}")
+        st.markdown(f"**Title:** {selected_story.title}")
+        st.markdown(f"**User Story:** {selected_story.user_story}")
+        st.markdown("**Acceptance Criteria:**")
+        for criterion in selected_story.acceptance_criteria:
+            st.markdown(f"- {criterion}")
+        if selected_story.tasks:
+            st.markdown("**Technical Tasks:**")
+            for task in selected_story.tasks:
+                st.markdown(f"- {task.title}")
+
+    # Check if we have existing execution evidence for this story
+    execution_evidence_key = f"execution_evidence_{selected_story.story_id}"
+    existing_evidence = st.session_state.get(execution_evidence_key)
+
+    if st.button("Execute Tests for this Story", key=f"execute_tests_{selected_story.story_id}"):
+        with st.spinner(f"Executing tests for story {selected_story.story_id}..."):
+            try:
+                # Generate execution evidence
+                evidence = generate_execution_evidence(
+                    selected_story.story_id,
+                    test_cases,
+                    os.getcwd()  # Use current workspace
+                )
+
+                # Store evidence in session state
+                st.session_state[execution_evidence_key] = evidence
+
+                st.success(f"Test execution completed for story {selected_story.story_id}")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Test execution failed: {str(e)}")
+                logger.error(f"Test execution error: {e}")
+
+    # Display execution evidence if available
+    if existing_evidence:
+        st.markdown("#### Execution Evidence")
+
+        # Show execution summary
+        summary = get_execution_status_summary(existing_evidence)
+        st.markdown(f"**Status:** {summary['status']}")
+        st.markdown(f"**Results:** {summary['passed']} passed, {summary['failed']} failed, {summary['blocked']} blocked, {summary['not_run']} not run")
+
+        # Show detailed results
+        if existing_evidence.session.execution_results:
+            st.markdown("**Test Results:**")
+            for result in existing_evidence.session.execution_results:
+                status_emoji = {
+                    TEST_EXECUTION_PASS: "✅",
+                    TEST_EXECUTION_FAIL: "❌",
+                    TEST_EXECUTION_BLOCKED: "⚠️",
+                    TEST_EXECUTION_NOT_RUN: "⏸️"
+                }.get(result.execution_status, "❓")
+
+                st.markdown(f"{status_emoji} **{result.test_id}**: {result.execution_status}")
+                if result.actual_result:
+                    st.caption(f"Result: {result.actual_result}")
+                if result.notes:
+                    st.caption(f"Notes: {result.notes}")
+                if result.defect_reference:
+                    st.caption(f"Defect: {result.defect_reference}")
+
+        # Human approval section
+        if not existing_evidence.approved:
+            st.markdown("#### Human Approval Required")
+            st.caption("Execution evidence must be approved before it can be used for Sprint Completion decisions.")
+
+            approver_notes = st.text_area(
+                "Approval Notes (optional)",
+                key=f"approver_notes_{selected_story.story_id}",
+                height=100,
+                placeholder="Add any notes about the test execution results..."
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Approve Execution Evidence", key=f"approve_evidence_{selected_story.story_id}"):
+                    try:
+                        approved_evidence = approve_test_execution(
+                            existing_evidence,
+                            approver_notes
+                        )
+                        st.session_state[execution_evidence_key] = approved_evidence
+                        st.success("Execution evidence approved!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Approval failed: {str(e)}")
+            with col2:
+                if st.button("Reject Evidence", key=f"reject_evidence_{selected_story.story_id}"):
+                    # Clear the evidence so user can re-run
+                    st.session_state.pop(execution_evidence_key, None)
+                    st.info("Execution evidence cleared. You can re-run tests.")
+                    st.rerun()
+        else:
+            st.success("✅ Execution evidence approved and ready for Sprint Completion")
+            st.caption(f"Approver notes: {existing_evidence.human_approval_notes or 'None'}")
+
+    # Show how this evidence will be used
+    st.markdown("#### How This Evidence is Used")
+    st.caption("""
+    - Approved execution evidence is consumed by Sprint Completion to determine story completion
+    - Stories require: implementation complete, review complete, and all tests passing (if testing required)
+    - Test execution evidence shows actual test results (pass/fail/blocked/not run)
+    - Sprint Completion will not mark stories as complete if tests are failing or blocked
+    """)
+
+def _render_test_cases_stage(lifecycle) -> None:
+    """
+    The test cases stage: generate from the approved implementation plan, review, edit,
+    approve explicitly.
+
+    Blocked safely when the upstream plan is missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent scope.
+    Nothing here writes to Jira or anywhere else -- nothing is marked Done merely
+    because test cases were generated.
+    """
+    plan = lifecycle.implementation_plan
+    if plan is None or getattr(plan, "is_empty", True):
+        st.info(
+            "No implementation plan in this session yet. Open the Implementation Plan "
+            "stage and generate one; the test cases are derived from the approved plan."
+        )
+        return
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.info(
+            "The implementation plan is pending review. Open the Implementation Plan "
+            "stage and approve it to generate test cases from it."
+        )
+        return
+
+    test_cases = _held_test_cases()
+
+    if st.button(
+        "Generate test cases from the approved implementation plan",
+        key="generate_test_cases",
+    ):
+        for key in list(st.session_state.keys()):
+            if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
+                st.session_state.pop(key, None)
+        st.session_state.pop(TEST_CASES_APPROVED_SESSION_KEY, None)
+        with st.spinner("Generating test cases from the approved implementation plan..."):
+            try:
+                generated = generate_test_suite(plan, client=CLIENT)
+            except Exception:
+                generated = _fallback_test_suite(plan)
+            if not generated:
+                generated = _fallback_test_suite(plan)
+            test_cases = _persist_test_cases(generated)
+
+    if test_cases is None:
+        st.caption(
+            "Not generated yet. This generates test cases from each story in the "
+            "approved implementation plan, covering functional, negative, edge case, "
+            "integration, and security tests where appropriate."
+        )
+        return
+
+    if not test_cases:
+        st.caption(
+            "No test cases could be derived from the approved implementation plan."
+        )
+        return
+
+    _render_test_case_traceability(test_cases, plan)
+
+    if bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.success("These test cases are approved.")
+        _render_test_case_readonly(test_cases)
+        if st.button("Revoke test cases approval to edit", key="revoke_test_cases_approval"):
+            st.session_state[TEST_CASES_APPROVED_SESSION_KEY] = False
+        return
+
+    st.caption(
+        "Approving records that you reviewed these test cases. Nothing is written to "
+        "Jira or to the plan."
+    )
+    if st.button("Approve test cases", key="approve_test_cases"):
+        st.session_state[TEST_CASES_APPROVED_SESSION_KEY] = True
+        _flash("success", "Test cases approved.")
+        return
+
+    # Edit mode: show editable test cases
+    edited_test_cases = _render_test_case_editor(test_cases)
+    if edited_test_cases is not test_cases:
+        # User made edits, persist them
+        test_cases = _persist_test_cases(edited_test_cases)
+        st.caption("Test cases updated. Review your changes and approve when ready.")
+
+
+def _render_test_execution_traceability(test_cases, test_execution) -> None:
+    """Show traceability from test execution back to test cases."""
+    if not test_cases:
+        st.caption("No test cases available.")
+        return
+
+    st.caption(
+        "Traceability: Test execution results for {} test case(s). "
+        "Each result links back to its test case, story and Jira issue.".format(
+            sum(len(suite.test_cases) for suite in test_cases)
+        )
+    )
+
+
+def _render_test_execution_editor(test_cases) -> list:
+    """Review and update surface for test execution results.
+
+    Test IDs are shown but not editable to preserve traceability.
+    Story reference is shown but not editable to preserve traceability.
+    """
+    if not test_cases:
+        return []
+
+    updated_suites = []
+    for suite_idx, suite in enumerate(test_cases):
+        updated_test_cases = []
+        for tc_idx, test_case in enumerate(suite.test_cases):
+            with st.container(border=True):
+                st.markdown(f"**Test Case {tc_idx + 1}: {test_case.test_id}**")
+                st.caption(f"*Story Reference:* `{test_case.story_reference}` (read-only)")
+                st.caption(f"*Scenario:* {test_case.scenario}")
+                st.caption(f"*Type:* {test_case.test_type} | *Priority:* {test_case.priority}")
+
+                # Execution status
+                status_options = [
+                    TEST_EXECUTION_NOT_RUN,
+                    TEST_EXECUTION_PASS,
+                    TEST_EXECUTION_FAIL,
+                    TEST_EXECUTION_BLOCKED,
+                ]
+                try:
+                    status_index = status_options.index(test_case.execution_status)
+                except ValueError:
+                    status_index = 0
+
+                new_status = st.selectbox(
+                    "Execution Status",
+                    options=status_options,
+                    index=status_index,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_status",
+                )
+
+                # Actual result
+                new_actual_result = st.text_area(
+                    "Actual Result",
+                    value=test_case.actual_result,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_actual_result",
+                    height=68,
+                )
+
+                # Notes
+                new_notes = st.text_area(
+                    "Notes",
+                    value=test_case.notes,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_notes",
+                    height=68,
+                )
+
+                # Defect reference
+                new_defect_reference = st.text_input(
+                    "Defect/Bug Reference (optional)",
+                    value=test_case.defect_reference,
+                    key=f"{_TEST_EXECUTION_WIDGET_PREFIX}suite_{suite_idx}_tc_{tc_idx}_defect",
+                )
+
+                # Create updated test case with execution data
+                updated_test_case = TestCase(
+                    test_id=test_case.test_id,
+                    story_reference=test_case.story_reference,
+                    scenario=test_case.scenario,
+                    preconditions=test_case.preconditions,
+                    steps=test_case.steps,
+                    expected_result=test_case.expected_result,
+                    priority=test_case.priority,
+                    test_type=test_case.test_type,
+                    is_approved=test_case.is_approved,
+                    execution_status=new_status,
+                    actual_result=new_actual_result,
+                    notes=new_notes,
+                    defect_reference=new_defect_reference,
+                )
+                updated_test_cases.append(updated_test_case)
+
+        updated_suite = TestSuite(
+            story_id=suite.story_id,
+            test_cases=updated_test_cases
+        )
+        updated_suites.append(updated_suite)
+
+    return updated_suites
+
+
+def _render_test_execution_stage(lifecycle) -> None:
+    """
+    The test execution stage: record execution results from the approved test cases.
+
+    Blocked safely when the upstream test cases are missing or unapproved: the stage says
+    what is missing instead of offering a control that would have to invent evidence.
+    Nothing here writes to Jira or anywhere else -- nothing is marked Done merely
+    because test execution was recorded.
+    """
+    test_cases = _held_test_cases()
+    if test_cases is None:
+        st.info(
+            "No test cases have been generated yet. Open the Test Cases stage and "
+            "generate them first; test execution is recorded against approved test cases."
+        )
+        return
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info(
+            "The test cases are pending review. Open the Test Cases stage and approve "
+            "them to record execution results."
+        )
+        return
+
+    _render_test_execution_traceability(test_cases, _held_test_execution())
+
+    # Edit mode: show editable test execution
+    updated_suites = _render_test_execution_editor(test_cases)
+    if updated_suites:
+        _persist_test_execution(updated_suites)
+        st.caption("Test execution results updated.")
+
+    # Show summary
+    if _held_test_execution():
+        updated_suites = _held_test_execution()
+    else:
+        updated_suites = test_cases
+
+    if not updated_suites:
+        return
+
+    # Count execution results
+    total_tests = 0
+    passed = 0
+    failed = 0
+    blocked = 0
+    not_run = 0
+    defects = []
+
+    for suite in updated_suites:
+        for tc in suite.test_cases:
+            total_tests += 1
+            if tc.execution_status == TEST_EXECUTION_PASS:
+                passed += 1
+            elif tc.execution_status == TEST_EXECUTION_FAIL:
+                failed += 1
+                if tc.defect_reference:
+                    defects.append(f"{tc.test_id}: {tc.defect_reference}")
+            elif tc.execution_status == TEST_EXECUTION_BLOCKED:
+                blocked += 1
+            else:
+                not_run += 1
+
+    st.markdown("**Execution Summary:**")
+    st.markdown(f"- Total: {total_tests}")
+    st.markdown(f"- Passed: {passed}")
+    st.markdown(f"- Failed: {failed}")
+    st.markdown(f"- Blocked: {blocked}")
+    st.markdown(f"- Not Run: {not_run}")
+
+    if defects:
+        st.markdown("**Defects/Bugs:**")
+        for defect in defects:
+            st.markdown(f"- {defect}")
+
+    st.caption(
+        "Recording execution results does not mark Jira issues as Done. Completion "
+        "requires explicit confirmation based on actual evidence."
+    )
+
+
+def _render_lifecycle_stage(lifecycle, stage: str) -> None:
+    """
+    One stage: its status, and either where it already lives or that it is not built.
+
+    A stage without a generator gets no control at all. A button that produced nothing
+    would claim a capability this app does not have.
+    """
+    st.markdown("#### {}".format(STAGE_LABEL[stage]))
+    state = lifecycle.state(stage)
+    st.markdown("**Status:** {}".format(state.status))
+    if state.detail:
+        st.caption(state.detail)
+
+    if stage == DISCOVERY_BRD:
+        if lifecycle.brd is None:
+            st.info(
+                "Select a transcript source at the top of this page and generate a BRD. "
+                "Manual paste, .txt upload, Google Meet and Microsoft Teams all work."
+            )
+        else:
+            st.success("Current BRD: **{}**".format(lifecycle.brd.project_title or "Untitled"))
+            st.caption(
+                "The BRD, its evidence validation and its Markdown export are rendered "
+                "above. This stage reports its state; it does not repeat it."
+            )
+            _render_brd_approval()
+    elif stage == PRD:
+        _render_prd_stage(lifecycle)
+    elif stage == ARCHITECTURE:
+        _render_architecture_stage(lifecycle)
+    elif stage == IMPLEMENTATION_PLAN:
+        _render_implementation_plan_stage(lifecycle)
+    elif stage == TEST_CASES:
+        _render_test_cases_stage(lifecycle)
+    elif stage == TEST_EXECUTION:
+        _render_test_execution_stage(lifecycle)
+    elif stage == DELIVERY_STATUS:
+        st.caption(
+            "The Jira connection, site and project selection, work plan, review and "
+            "issue creation are in the Jira section above, along with the created issue "
+            "keys and the requirements each one came from. Step 6 there maps the approved "
+            "implementation plan onto this project's own issue hierarchy and records the "
+            "plan item → issue key mapping."
+        )
+        _render_plan_delivery_status(lifecycle)
+        _render_sprint_completion_capability(lifecycle)
+    else:
+        st.info(
+            "{} is not implemented yet. Nothing here generates an artifact.".format(
+                STAGE_LABEL[stage]
+            )
+        )
+
+
+def _render_lifecycle_workspace() -> None:
+    """
+    The project workspace: every lifecycle stage, its status, and the selected stage.
+
+    Read-only. Each status is derived from an artifact this session actually holds, so
+    no stage can report progress that was not made, and the stages with no generator
+    yet say so rather than offering a control that does nothing.
     """
     st.divider()
-    st.subheader("Requirement changes (optional)")
+    st.subheader("Project delivery lifecycle")
+    st.caption(
+        "The delivery flow this project is being built towards. Discovery → BRD, "
+        "Product Definition → PRD, Architecture, Implementation Plan and the Jira "
+        "delivery stage are implemented; the stages between them are navigable and "
+        "report that they are not implemented yet."
+    )
 
     brd_data = st.session_state.get(BRD_SESSION_KEY)
-    if not isinstance(brd_data, BRDData):
-        st.caption(
-            "No BRD is available yet. Change detection compares a later meeting against "
-            "approved requirements, so generate a BRD above first."
-        )
-        return
-
-    changes_key = _skey(JIRA_STATE_NAME, "changes")
-
-    st.markdown("**Jira-driven drift**")
-    st.caption(
-        "Compare the current Jira fields with the values saved when these issues were "
-        "created. This is read-only and produces pending proposals."
+    prd_data = st.session_state.get(PRD_SESSION_KEY)
+    architecture_data = st.session_state.get(ARCHITECTURE_SESSION_KEY)
+    plan_data = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
+    test_cases_data = st.session_state.get(TEST_CASES_SESSION_KEY)
+    lifecycle = lifecycle_from(
+        brd=brd_data if isinstance(brd_data, BRDData) else None,
+        discovery_source=str(st.session_state.get(BRD_SOURCE_SESSION_KEY) or ""),
+        plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
+        created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
+        brd_approved=_brd_approved(),
+        prd=prd_data if isinstance(prd_data, PRDData) else None,
+        prd_approved=bool(st.session_state.get(PRD_APPROVED_SESSION_KEY)),
+        architecture=(
+            architecture_data if isinstance(architecture_data, ArchitectureData) else None
+        ),
+        architecture_approved=bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY)),
+        implementation_plan=(
+            plan_data if isinstance(plan_data, ImplementationPlan) else None
+        ),
+        implementation_plan_approved=bool(
+            st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)
+        ),
+        test_cases=test_cases_data,
+        test_cases_approved=bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)),
+        delivery_mapping=st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping")),
     )
-    _render_jira_drift_detection(brd_data, changes_key)
-
-    st.markdown("**Meeting-driven changes**")
-    st.caption(
-        "Each result is a proposal awaiting your approval: detecting and reviewing "
-        "changes nothing in the BRD and nothing in Jira."
-    )
-
-    label = st.radio(
-        "New evidence source",
-        TRANSCRIPT_SOURCES,
-        horizontal=True,
-        key="change_source",
-    )
-    transcript = _new_change_evidence(label)
-
-    if transcript is not None:
-        with st.spinner("Comparing this source against the approved requirements..."):
-            st.session_state[changes_key] = detect_meeting_changes(
-                brd_data,
-                transcript,
-                plan=st.session_state.get(_skey(JIRA_STATE_NAME, "plan")),
-                created=st.session_state.get(_skey(JIRA_STATE_NAME, "created")) or (),
-                generate=_planner_generate(),
+    for position, stage in enumerate(LIFECYCLE_STAGES, start=1):
+        st.markdown(
+            "{}. **{}** — {}{}".format(
+                position,
+                STAGE_LABEL[stage],
+                lifecycle.state(stage).status,
+                "" if stage in IMPLEMENTED_STAGES else " (not implemented yet)",
             )
-
-    proposal = st.session_state.get(changes_key)
-    if not isinstance(proposal, ChangeProposal):
-        st.caption("Not run yet. Detecting changes creates nothing and changes nothing.")
-        return
-
-    for note in proposal.notes:
-        st.info(note)
-
-    if proposal.is_empty:
-        st.success("No requirement change was proposed from this source.")
-        return
-
-    pending = len(proposal.pending)
-    review = len(proposal.needing_review)
-    st.markdown(
-        "**{} proposed change(s)**, {} pending your decision{}.".format(
-            len(proposal.changes),
-            pending,
-            ", {} needing manual review".format(review) if review else "",
         )
-    )
 
-    for change in proposal.changes:
-        _render_requirement_change(change)
-
-    _render_change_decisions(proposal, changes_key, brd_data)
+    labels = [STAGE_LABEL[stage] for stage in LIFECYCLE_STAGES]
+    st.sidebar.markdown("### Project workspace")
+    selected = st.sidebar.radio("Lifecycle stage", labels, key="lifecycle_stage")
+    stage = LIFECYCLE_STAGES[labels.index(selected)] if selected in labels else DISCOVERY_BRD
+    _render_lifecycle_stage(lifecycle, stage)
 
 
 def _render_provider_section(provider) -> Optional[NormalizedTranscript]:
@@ -2498,7 +4700,7 @@ if transcript_to_process:
                 brd_data = generate_brd_from_transcript(transcript_to_process)
 
             # Kept for the optional Jira step below, which runs after a re-run.
-            _store_brd(brd_data)
+            _store_brd(brd_data, transcript_to_process.source)
 
             # --- Display the generated BRD ---
             display_brd(brd_data)
@@ -2523,8 +4725,7 @@ if transcript_to_process:
 # it. The only write is issue creation, which requires an explicit confirmation.
 _render_jira_section()
 
-# --- Optional Requirement Change Detection ---
-# Compares a later meeting against the approved BRD and reports what it would change.
-# Rendered after Jira so the impact it reports can name the plan and the issues created
-# above. It takes no service and no token, so it cannot write anywhere.
-_render_requirement_changes_section()
+# --- Project Lifecycle Workspace ---
+# Rendered last so the status it reports can read the BRD above and the plan and
+# created issues from the Jira section. It takes no service and no token.
+_render_lifecycle_workspace()
