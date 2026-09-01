@@ -3719,6 +3719,15 @@ def _render_implementation_plan_stage(lifecycle) -> None:
 
     if bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
         st.success("This implementation plan is approved.")
+
+        # --- AI Coding Agent Capability (when implementation plan and test cases are approved) ---
+        if lifecycle.state("test_cases").status == "Approved":
+            _render_coding_agent_capability(lifecycle)
+        else:
+            st.info(
+                "Generate and approve test cases to enable the AI Coding Agent."
+            )
+
         _render_plan_readonly(plan)
         if st.button(
             "Revoke implementation plan approval to edit", key="revoke_plan_approval"
@@ -3735,6 +3744,96 @@ def _render_implementation_plan_stage(lifecycle) -> None:
     if st.button("Approve implementation plan", key="approve_implementation_plan"):
         st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = True
         _flash("success", "Implementation plan approved.")
+
+
+def _render_coding_agent_capability(lifecycle) -> None:
+    """
+    AI Coding Agent capability: implements approved stories end-to-end.
+    """
+    st.markdown("#### AI Coding Agent")
+
+    if lifecycle.state("implementation_plan").status != "Approved":
+        st.info("Generate and approve an implementation plan to enable the AI Coding Agent.")
+        return
+
+    if lifecycle.state("test_cases").status != "Approved":
+        st.info("Generate and approve test cases to enable AI Coding Agent verification.")
+        return
+
+    plan = lifecycle.implementation_plan
+    if not plan or plan.is_empty:
+        st.info("No implementation plan available.")
+        return
+
+    st.markdown("**Select Story to Implement**")
+    story_options = {f"{story.story_id}: {story.title}": story for story in plan.stories}
+
+    if not story_options:
+        st.info("No stories found in implementation plan.")
+        return
+
+    selected_story_label = st.selectbox(
+        "Choose a story from the approved implementation plan:",
+        options=list(story_options.keys()),
+        key="coding_agent_story_select"
+    )
+
+    selected_story = story_options.get(selected_story_label)
+    if not selected_story:
+        return
+
+    with st.expander("Story Details", expanded=False):
+        st.markdown(f"**ID:** {selected_story.story_id}")
+        st.markdown(f"**Title:** {selected_story.title}")
+        st.markdown(f"**User Story:** {selected_story.user_story}")
+        st.markdown("**Acceptance Criteria:**")
+        for criterion in selected_story.acceptance_criteria:
+            st.markdown(f"- {criterion}")
+        if selected_story.tasks:
+            st.markdown("**Technical Tasks:**")
+            for task in selected_story.tasks:
+                st.markdown(f"- {task.title}")
+
+    if st.button("Run AI Coding Agent", key="run_coding_agent"):
+        with st.spinner("Running AI Coding Agent..."):
+            from coding_agent import run_ai_coding_agent
+            result = run_ai_coding_agent(selected_story)
+            st.session_state.coding_agent_result = result
+            st.session_state.coding_agent_story_id = selected_story.story_id
+
+    if 'coding_agent_result' in st.session_state and st.session_state.coding_agent_story_id == selected_story.story_id:
+        result = st.session_state.coding_agent_result
+        st.markdown("### Execution Results")
+        if result.blocked:
+            st.error(f"**Blocked:** {result.blocked_reason}")
+        else:
+            st.success("**Execution Completed**")
+
+        if result.files_changed:
+            st.markdown("**Files Changed:**")
+            for change in result.files_changed:
+                if change.change_type == "created":
+                    st.markdown(f"- ✅ **{change.file_path}** (created)")
+                else:
+                    st.markdown(f"- 🔄 **{change.file_path}** (modified)")
+        else:
+            st.markdown("**Files Changed:** None")
+
+        if result.fix_attempts > 0:
+            st.markdown(f"**Fix Attempts:** {result.fix_attempts}")
+
+        if result.test_suites:
+            st.markdown("**Test Results:**")
+            for suite in result.test_suites:
+                for tc in suite.test_cases:
+                    st.markdown(f"- **{tc.test_id}**: {tc.scenario} ({tc.execution_status})")
+        else:
+            st.markdown("**Test Results:** None")
+
+        if result.evidence_generated:
+            st.info("✅ Evidence generated for traceability")
+        else:
+            st.warning("⚠️ No evidence generated")
 
 
 def _render_plan_delivery_status(lifecycle) -> None:
