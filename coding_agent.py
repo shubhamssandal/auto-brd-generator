@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # Maximum corrective retries after the initial generation fails tests.
 MAX_FIX_ATTEMPTS = 3
 
+from google import genai  # noqa: F401  (referenced by test patches)
+from google.genai import types  # noqa: F401
+
 
 @dataclass
 class CodeChange:
