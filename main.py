@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from dataclasses import replace
 from typing import Optional
 
@@ -62,6 +63,11 @@ from prd_generator import generate_prd
 from prd_models import PRDData
 from test_case_generator import generate_test_suite, _fallback_test_suite
 from test_case_models import TestCase, TestSuite, TEST_EXECUTION_NOT_RUN, TEST_EXECUTION_PASS, TEST_EXECUTION_FAIL, TEST_EXECUTION_BLOCKED
+from execution_engine import (
+    generate_execution_evidence,
+    get_execution_status_summary,
+    approve_test_execution,
+)
 from sprint_completion import complete_sprint, recommend_next_sprint
 from sprint_completion_models import SprintCompletion
 from jira_processor import (
@@ -110,6 +116,8 @@ if GEMINI_API_KEY:
 # The one model this app calls, named once so BRD generation and Jira work planning
 # cannot drift onto different models.
 GEMINI_MODEL = "gemini-3.6-flash"
+
+logger = logging.getLogger(__name__)
 
 
 def _gemini_json(prompt: str) -> str:
@@ -3735,6 +3743,10 @@ def _render_implementation_plan_stage(lifecycle) -> None:
             st.session_state[IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY] = False
         return
 
+    # --- Test Execution Capability ---
+    if bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)) and lifecycle.state("implementation_plan").status == "Approved":
+        _render_test_execution_capability(lifecycle)
+
     plan = _render_plan_editor(plan, architecture)
     st.caption(
         "Approving records that you reviewed this plan. Nothing is created in Jira: the "
@@ -4015,6 +4027,175 @@ def _render_sprint_completion_capability(lifecycle) -> None:
                 if not sc.approved:
                     st.caption("⏳ Pending reviewer approval")
 
+
+def _render_test_execution_capability(lifecycle) -> None:
+    """
+    Test Execution Capability: Execute approved test cases and collect execution evidence.
+
+    This capability executes repository tests for approved test cases, captures
+    execution evidence, and requires human approval before this evidence is
+    consumed by Sprint Completion.
+
+    Execution mapping:
+    - exit code 0 → Pass
+    - non-zero test failure → Fail
+    - unable/unexecutable → Blocked/Not Run with clear reason
+    - no executable mapping → Not Run
+
+    Safety:
+    - workspace confinement, timeout, safe subprocess
+    - no arbitrary path traversal
+    - evidence captured with test IDs and story references
+    - human approval required before delivery evidence
+    """
+    st.markdown("### Test Execution & Delivery Evidence")
+
+    # Need approved test cases and implementation plan
+    test_cases = _held_test_cases()
+    if not test_cases:
+        st.info("Generate and approve test cases to enable test execution.")
+        return
+
+    if not bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)):
+        st.info("The test cases are pending review. Approve them to enable test execution.")
+        return
+
+    if lifecycle.state("implementation_plan").status != "Approved":
+        st.info("Generate and approve an implementation plan to enable test execution.")
+        return
+
+    # Get the implementation plan
+    plan = lifecycle.implementation_plan
+    if not plan or plan.is_empty:
+        st.info("No implementation plan available.")
+        return
+
+    st.caption("Execution evidence is required for Sprint Completion to determine story completion.")
+
+    # Select story to execute
+    story_options = {f"{story.story_id}: {story.title}": story for story in plan.stories}
+
+    if not story_options:
+        st.info("No stories found in implementation plan.")
+        return
+
+    selected_story_label = st.selectbox(
+        "Choose a story to execute:",
+        options=list(story_options.keys()),
+        key="test_execution_story_select"
+    )
+
+    selected_story = story_options.get(selected_story_label)
+    if not selected_story:
+        return
+
+    with st.expander("Story Details", expanded=False):
+        st.markdown(f"**ID:** {selected_story.story_id}")
+        st.markdown(f"**Title:** {selected_story.title}")
+        st.markdown(f"**User Story:** {selected_story.user_story}")
+        st.markdown("**Acceptance Criteria:**")
+        for criterion in selected_story.acceptance_criteria:
+            st.markdown(f"- {criterion}")
+        if selected_story.tasks:
+            st.markdown("**Technical Tasks:**")
+            for task in selected_story.tasks:
+                st.markdown(f"- {task.title}")
+
+    # Check if we have existing execution evidence for this story
+    execution_evidence_key = f"execution_evidence_{selected_story.story_id}"
+    existing_evidence = st.session_state.get(execution_evidence_key)
+
+    if st.button("Execute Tests for this Story", key=f"execute_tests_{selected_story.story_id}"):
+        with st.spinner(f"Executing tests for story {selected_story.story_id}..."):
+            try:
+                # Generate execution evidence
+                evidence = generate_execution_evidence(
+                    selected_story.story_id,
+                    test_cases,
+                    os.getcwd()  # Use current workspace
+                )
+
+                # Store evidence in session state
+                st.session_state[execution_evidence_key] = evidence
+
+                st.success(f"Test execution completed for story {selected_story.story_id}")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Test execution failed: {str(e)}")
+                logger.error(f"Test execution error: {e}")
+
+    # Display execution evidence if available
+    if existing_evidence:
+        st.markdown("#### Execution Evidence")
+
+        # Show execution summary
+        summary = get_execution_status_summary(existing_evidence)
+        st.markdown(f"**Status:** {summary['status']}")
+        st.markdown(f"**Results:** {summary['passed']} passed, {summary['failed']} failed, {summary['blocked']} blocked, {summary['not_run']} not run")
+
+        # Show detailed results
+        if existing_evidence.session.execution_results:
+            st.markdown("**Test Results:**")
+            for result in existing_evidence.session.execution_results:
+                status_emoji = {
+                    TEST_EXECUTION_PASS: "✅",
+                    TEST_EXECUTION_FAIL: "❌",
+                    TEST_EXECUTION_BLOCKED: "⚠️",
+                    TEST_EXECUTION_NOT_RUN: "⏸️"
+                }.get(result.execution_status, "❓")
+
+                st.markdown(f"{status_emoji} **{result.test_id}**: {result.execution_status}")
+                if result.actual_result:
+                    st.caption(f"Result: {result.actual_result}")
+                if result.notes:
+                    st.caption(f"Notes: {result.notes}")
+                if result.defect_reference:
+                    st.caption(f"Defect: {result.defect_reference}")
+
+        # Human approval section
+        if not existing_evidence.approved:
+            st.markdown("#### Human Approval Required")
+            st.caption("Execution evidence must be approved before it can be used for Sprint Completion decisions.")
+
+            approver_notes = st.text_area(
+                "Approval Notes (optional)",
+                key=f"approver_notes_{selected_story.story_id}",
+                height=100,
+                placeholder="Add any notes about the test execution results..."
+            )
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Approve Execution Evidence", key=f"approve_evidence_{selected_story.story_id}"):
+                    try:
+                        approved_evidence = approve_test_execution(
+                            existing_evidence,
+                            approver_notes
+                        )
+                        st.session_state[execution_evidence_key] = approved_evidence
+                        st.success("Execution evidence approved!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Approval failed: {str(e)}")
+            with col2:
+                if st.button("Reject Evidence", key=f"reject_evidence_{selected_story.story_id}"):
+                    # Clear the evidence so user can re-run
+                    st.session_state.pop(execution_evidence_key, None)
+                    st.info("Execution evidence cleared. You can re-run tests.")
+                    st.rerun()
+        else:
+            st.success("✅ Execution evidence approved and ready for Sprint Completion")
+            st.caption(f"Approver notes: {existing_evidence.human_approval_notes or 'None'}")
+
+    # Show how this evidence will be used
+    st.markdown("#### How This Evidence is Used")
+    st.caption("""
+    - Approved execution evidence is consumed by Sprint Completion to determine story completion
+    - Stories require: implementation complete, review complete, and all tests passing (if testing required)
+    - Test execution evidence shows actual test results (pass/fail/blocked/not run)
+    - Sprint Completion will not mark stories as complete if tests are failing or blocked
+    """)
 
 def _render_test_cases_stage(lifecycle) -> None:
     """

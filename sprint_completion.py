@@ -8,7 +8,7 @@ backlog, and recommends the next sprint using existing recommendation logic.
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from lifecycle_models import ProjectLifecycle, StageState
 from sprint_completion_models import (
@@ -24,6 +24,14 @@ from test_case_models import (
     TEST_EXECUTION_BLOCKED,
     TestCase,
     TestSuite,
+)
+
+# Import the new test execution module
+from execution_engine import (
+    generate_execution_evidence,
+    get_execution_status_summary,
+    TestExecutionEvidence,
+    TestExecutionSession,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,8 +152,25 @@ def _gather_story_evidence(
     review_complete = implementation_complete  # same gate for now
 
     # Test results: aggregate from test execution stage
+    # First check for approved test execution evidence, then fall back to test cases
     test_results = (0, 0, 0, 0)  # passed, failed, blocked, not_run
-    if test_cases is not None:
+
+    # Check for test execution evidence in session state
+    execution_evidence_key = f"execution_evidence_{getattr(story, 'story_id', '')}"
+    execution_evidence = st.session_state.get(execution_evidence_key)
+
+    if execution_evidence and isinstance(execution_evidence, dict) and execution_evidence.get('approved'):
+        # Use test execution evidence if approved
+        from execution_engine import get_execution_status_summary
+        summary = get_execution_status_summary(execution_evidence)
+        test_results = (
+            summary['passed'],
+            summary['failed'],
+            summary['blocked'],
+            summary['not_run']
+        )
+    elif test_cases is not None:
+        # Fall back to original test cases if no execution evidence
         test_results = _story_test_summary(test_cases, getattr(story, 'story_id', ''))
 
     return implementation_complete, review_complete, test_results
