@@ -5,7 +5,7 @@ Reuses the existing AI Coding Agent for story-level implementation.
 """
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, List, Optional
 
 from coding_agent import CodeChange, TestSuite, run_ai_coding_agent
@@ -70,17 +70,31 @@ def execute_sprint(
 
     This is the main entry point for sprint-level coding execution.
     It:
-    1. Iterates through all sprint stories in order
-    2. Runs the existing AI Coding Agent for each story
-    3. Aggregates evidence from all stories
-    4. Requires human approval before marking as approved
+    1. Checks that the sprint has been approved before execution.
+    2. Iterates through all sprint stories in order.
+    3. Runs the existing AI Coding Agent for each story.
+    4. Aggregates evidence from all stories.
+    5. Requires human approval before marking as approved.
 
     The execution follows the existing coding_agent pattern where:
-    - Each story maintains independent state
-    - Failed/blocked stories are tracked but don't corrupt other stories
-    - Fix attempts are per-story
-    - Evidence is preserved per-story
+    - Each story maintains independent state.
+    - Failed/blocked stories are tracked but don't corrupt other stories.
+    - Fix attempts are per-story.
+    - Evidence is preserved per-story.
     """
+    # Enforce sprint approval before any execution begins
+    if not getattr(sprint_plan, "approved", False):
+        # Sprint not approved – block execution and require human approval
+        result = SprintExecutionResult(
+            sprint_id=getattr(sprint_plan, "sprint_id", ""),
+            sprint_name=getattr(sprint_plan, "sprint_name", ""),
+            overall_status="Not Started",
+            human_approval_required=True,
+        )
+        result.blockers.append("Sprint execution blocked: sprint not approved by human.")
+        logger.info("Sprint execution blocked because sprint is not approved.")
+        return result
+
     sprint_id = getattr(sprint_plan, 'sprint_id', '')
     sprint_name = getattr(sprint_plan, 'sprint_name', '')
     logger.info(f"Starting sprint execution: {sprint_name} (ID: {sprint_id})")
@@ -99,6 +113,8 @@ def execute_sprint(
     # Track which stories have been started to identify not-started stories
     stories_processed = 0
     stories_in_sprint = 0
+    # Per-story outcomes for sprint completion to use
+    story_outcomes = {}
 
     try:
         # Get all stories from the sprint
@@ -131,20 +147,18 @@ def execute_sprint(
                 result.total_stories += 1
                 result.total_fix_attempts += story_result.fix_attempts
 
-                # Classify story outcome
-                if story_result.fix_attempts > 0:
-                    # Had retries - counts as failed regardless of blocked status
-                    result.failed_stories += 1
-                    result.blockers.append(f"Story {story_id}: Failed after {story_result.fix_attempts} attempts")
-                    logger.info(f"Story {story_id} failed after {story_result.fix_attempts} attempts")
-                elif story_result.blocked:
-                    # Blocked before any retries (e.g., not ready)
+                # Classify story outcome based on coding agent result
+                if story_result.blocked:
+                    # Blocked (not ready or failed after max retries)
                     result.blockers.append(f"Story {story_id}: {story_result.blocked_reason}")
                     result.blocked_stories += 1
                     logger.info(f"Story {story_id} blocked: {story_result.blocked_reason}")
+                    story_outcomes[story_id] = {'completed': False, 'failed': False, 'blocked': True, 'fix_attempts': story_result.fix_attempts}
                 else:
+                    # Implementation succeeded (may have had retries)
                     result.completed_stories += 1
-                    logger.info(f"Story {story_id} completed successfully")
+                    logger.info(f"Story {story_id} completed successfully after {story_result.fix_attempts} fix attempt(s)")
+                    story_outcomes[story_id] = {'completed': True, 'failed': False, 'blocked': False, 'fix_attempts': story_result.fix_attempts}
 
                 # Aggregate files changed and test results
                 result.files_changed.extend(story_result.files_changed)
@@ -154,6 +168,10 @@ def execute_sprint(
         logger.error(f"Error during sprint execution: {e}")
         result.overall_status = "Blocked"
         result.blockers.append(f"Sprint execution error: {str(e)}")
+
+    # Store per-story outcomes on lifecycle for sprint completion
+    if lifecycle is not None:
+        lifecycle.story_execution_outcomes = story_outcomes
 
     # Determine overall status
     if result.total_stories == 0:
@@ -169,7 +187,7 @@ def execute_sprint(
     # Set not_started stories
     result.not_started_stories = stories_in_sprint - stories_processed
 
-    # Store sprint execution in delivery mapping for traceability
+    # Store sprint execution in delivery mapping for traceability (preserve real issue keys if available)
     _record_sprint_execution(lifecycle, result, sprint_plan)
 
     logger.info(
@@ -177,40 +195,76 @@ def execute_sprint(
         f"status={result.overall_status}, human_approval_required={result.human_approval_required}"
     )
 
+    # Store the result in lifecycle for sprint completion to use
+    if lifecycle is not None:
+        lifecycle.last_sprint_execution_result = result
+
     return result
 
 
 def _record_sprint_execution(
     lifecycle: Any, result: SprintExecutionResult, sprint_plan: Any
 ) -> None:
-    """Record sprint execution in delivery mapping."""
+    """Record sprint execution in delivery mapping, preserving any existing issue keys."""
     try:
-        # Create a delivery mapping for the sprint execution
+        # Retrieve any existing delivery mapping from the lifecycle, if present
+        existing_mapping = getattr(lifecycle, 'delivery_mapping', None)
+        base_links = []
+        if isinstance(existing_mapping, DeliveryMapping):
+            # Preserve existing links (e.g., from implementation plan to Jira)
+            base_links = list(existing_mapping.links)
+
+        # Create a new delivery mapping for the sprint execution (or extend existing)
         delivery_mapping = DeliveryMapping(
             project_identifier="sprint_execution",
             project_label=f"Sprint {result.sprint_id or 'unknown'} Execution",
-            links=tuple(),  # Will populate below
+            links=tuple(),
             notes=(f"Sprint execution: {result.completed_stories}/{result.total_stories} stories completed",)
         )
 
-        # Add sprint execution links to individual stories
-        links = list(delivery_mapping.links)
-        for story_id in [getattr(issue, 'story_id', '') for issue in sprint_plan.issues]:
-            if story_id:
+        # Add sprint execution links for each story, reusing real issue keys when available
+        links = []
+        for issue in sprint_plan.issues:
+            story_id = getattr(issue, 'story_id', '')
+            if not story_id:
+                continue
+            # Check if there is an existing delivery link for this story_id
+            existing_link = None
+            if isinstance(existing_mapping, DeliveryMapping):
+                existing_link = existing_mapping.link_for(story_id)
+            if existing_link and existing_link.issue_key:
+                # Preserve the real Jira issue key
                 links.append(
                     DeliveryLink(
-                        plan_item_id=f"sprint_exec_{result.sprint_id or 'unknown'}",
-                        issue_key="",  # Not a real Jira issue, just for tracking
+                        plan_item_id=story_id,
+                        issue_key=existing_link.issue_key,
+                        issue_type_name=existing_link.issue_type_name,
+                        summary=existing_link.summary,
+                        work_type=existing_link.work_type,
+                        feature_ids=existing_link.feature_ids,
+                        component_ids=existing_link.component_ids,
+                    )
+                )
+            else:
+                # No real issue; create an unlinked placeholder for traceability
+                links.append(
+                    DeliveryLink(
+                        plan_item_id=story_id,
+                        issue_key="",
                         issue_type_name="sprint_execution",
-                        summary=f"Sprint {result.sprint_id} execution",
+                        summary=f"Sprint {result.sprint_id} execution for story {story_id}",
                         work_type="sprint_execution",
                         feature_ids=(),
                         component_ids=(),
                     )
                 )
-        delivery_mapping = replace(delivery_mapping, links=tuple(links))
+        # Combine any base links with the new sprint execution links, avoiding duplicates by plan_item_id
+        combined_links = {link.plan_item_id: link for link in base_links}
+        for link in links:
+            combined_links[link.plan_item_id] = link
+        delivery_mapping = replace(delivery_mapping, links=tuple(combined_links.values()))
 
-        # Store the delivery mapping for traceability
+        # Store the delivery mapping for traceability on the lifecycle
         if not hasattr(lifecycle, 'sprint_executions'):
             lifecycle.sprint_executions = []
         lifecycle.sprint_executions.append(delivery_mapping)
