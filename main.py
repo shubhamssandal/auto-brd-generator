@@ -45,6 +45,7 @@ from lifecycle_models import (
     IMPLEMENTED_STAGES,
     LIFECYCLE_STAGES,
     PRD,
+    SPRINT_PLAN,
     STAGE_LABEL,
     TEST_CASES,
     TEST_EXECUTION,
@@ -70,6 +71,8 @@ from execution_engine import (
 )
 from sprint_completion import complete_sprint, recommend_next_sprint
 from sprint_completion_models import SprintCompletion
+from sprint_generator import generate_sprint_plan_from_implementation_plan
+from sprint_models import SprintPlan
 from jira_processor import (
     compatible_issue_types,
     creation_order,
@@ -744,6 +747,16 @@ SPRINT_COMPLETION_HISTORY_KEY = "sprint_completion_history"
 SPRINT_COMPLETION_LAST_KEY = "sprint_completion_last"
 SPRINT_COMPLETION_NEXT_KEY = "sprint_completion_next"
 SPRINT_COMPLETION_APPROVED_KEY = "sprint_completion_next_approved"
+# NOTE: SPRINT_PLAN_SESSION_KEY and SPRINT_PLAN_APPROVED_SESSION_KEY are defined in lifecycle_models.py
+
+# Sprint Planning session keys
+SPRINT_PLAN_SESSION_KEY = "sprint_plan_data"
+SPRINT_PLAN_APPROVED_SESSION_KEY = "sprint_plan_approved"
+SPRINT_PLAN_GENERATED_KEY = "sprint_plan_generated"
+
+# Reuse the existing backlog recommendation logic without overriding the lifecycle
+# generator: the lifecycle sprint plan is built from the approved implementation plan.
+_SPRINT_WIDGET_PREFIX = "sprint_plan_review__"
 
 
 def _clear_prd_widgets() -> None:
@@ -751,6 +764,36 @@ def _clear_prd_widgets() -> None:
     for key in list(st.session_state.keys()):
         if str(key).startswith(_PRD_WIDGET_PREFIX):
             st.session_state.pop(key, None)
+
+
+def _clear_sprint_plan_state() -> None:
+    """
+    Forget the generated sprint plan, its approval and its editors.
+
+    Called when the implementation plan changes for the same reason downstream stages
+    are cleared when their upstream artifact changes: a sprint plan is a planning of one
+    specific implementation plan, so a new plan makes a held sprint plan wrong rather
+    than merely old, and its approval cannot carry over.
+    """
+    for key in (
+        SPRINT_PLAN_SESSION_KEY,
+        SPRINT_PLAN_APPROVED_SESSION_KEY,
+        SPRINT_PLAN_GENERATED_KEY,
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(_SPRINT_WIDGET_PREFIX):
+            st.session_state.pop(key, None)
+
+
+def _held_sprint_plan():
+    plan = st.session_state.get(SPRINT_PLAN_SESSION_KEY)
+    return plan if isinstance(plan, SprintPlan) else None
+
+
+def _persist_sprint_plan(plan: SprintPlan) -> SprintPlan:
+    st.session_state[SPRINT_PLAN_SESSION_KEY] = plan
+    return plan
 
 
 def _clear_test_cases_state() -> None:
@@ -809,6 +852,7 @@ def _clear_implementation_plan_state() -> None:
         if str(key).startswith(_PLAN_WIDGET_PREFIX):
             st.session_state.pop(key, None)
     _clear_test_cases_state()
+    _clear_sprint_plan_state()
 
 
 def _clear_architecture_state() -> None:
@@ -3880,6 +3924,104 @@ def _render_plan_delivery_status(lifecycle) -> None:
     )
 
 
+def _render_sprint_planning_stage(lifecycle) -> None:
+    """
+    The sprint planning stage: derive a SprintPlan from the approved implementation plan,
+    review, edit and approve it explicitly.
+
+    Blocked safely when the upstream implementation plan is missing or unapproved: a
+    sprint planned against an unapproved plan would create work nobody signed off.
+    Approval is recorded on the actual SprintPlan instance held in session state, so
+    the same object later passed to ``execute_sprint`` carries the approval flag.
+    """
+    plan = lifecycle.implementation_plan
+    if plan is None or getattr(plan, "is_empty", True):
+        st.info(
+            "No implementation plan in this session yet. Open the Implementation Plan "
+            "stage and generate one; the sprint plan is derived from the approved plan."
+        )
+        return
+    if not bool(st.session_state.get(IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY)):
+        st.info(
+            "The implementation plan is pending review. Open the Implementation Plan "
+            "stage and approve it to generate a sprint from it."
+        )
+        return
+
+    sprint_plan = _held_sprint_plan()
+    delivery_mapping = st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping"))
+
+    if st.button(
+        "Generate sprint plan from the approved implementation plan",
+        key="generate_sprint_plan",
+    ):
+        _clear_sprint_plan_state()
+        with st.spinner(
+            "Deriving a sprint scope from the approved implementation plan..."
+        ):
+            sprint_plan = _persist_sprint_plan(
+                generate_sprint_plan_from_implementation_plan(
+                    plan,
+                    delivery_mapping=delivery_mapping
+                    if isinstance(delivery_mapping, DeliveryMapping)
+                    else None,
+                )
+            )
+
+    if sprint_plan is None:
+        st.caption(
+            "Not generated yet. This proposes a sprint scope from every story in the "
+            "approved implementation plan, in dependency order, and preserves any Jira "
+            "issue keys already created from this plan. It creates nothing in Jira and "
+            "executes nothing."
+        )
+        return
+
+    approved = bool(st.session_state.get(SPRINT_PLAN_APPROVED_SESSION_KEY))
+
+    st.caption(
+        "**{}** · goal: {} · {} story/stories proposed · {} selected · {}".format(
+            sprint_plan.sprint_name,
+            sprint_plan.sprint_goal or "(not set)",
+            len(sprint_plan.issues),
+            len(sprint_plan.selected_issues),
+            "approved" if approved else "pending review",
+        )
+    )
+
+    st.markdown("**Proposed sprint scope**")
+    for issue in sprint_plan.issues:
+        story_label = issue.story_id or "(no story id)"
+        jira_label = issue.issue_key or "no Jira issue yet"
+        st.markdown(
+            "- `{}` — **{}** (Jira: `{}`)".format(story_label, issue.summary, jira_label)
+        )
+
+    if approved:
+        st.success(
+            "This sprint plan is approved. The same SprintPlan is now held in session "
+            "state and will be the one ``execute_sprint`` runs against."
+        )
+        if st.button(
+            "Revoke sprint approval to edit", key="revoke_sprint_approval"
+        ):
+            st.session_state.pop(SPRINT_PLAN_APPROVED_SESSION_KEY, None)
+            sprint_plan.approved = False
+            _persist_sprint_plan(sprint_plan)
+            _flash("info", "Sprint approval revoked. The sprint is pending review again.")
+        return
+
+    st.caption(
+        "Approving records that you reviewed this sprint scope. The exact SprintPlan "
+        "above is then the object handed to ``execute_sprint`` later."
+    )
+    if st.button("Approve sprint", key="approve_sprint_plan"):
+        sprint_plan.approved = True
+        _persist_sprint_plan(sprint_plan)
+        st.session_state[SPRINT_PLAN_APPROVED_SESSION_KEY] = True
+        _flash("success", "Sprint plan approved. The same plan is now the one that will be executed.")
+
+
 def _render_sprint_completion_capability(lifecycle) -> None:
     """
     Sprint Completion capability: evaluate the current sprint using implementation,
@@ -4508,6 +4650,8 @@ def _render_lifecycle_stage(lifecycle, stage: str) -> None:
         )
         _render_plan_delivery_status(lifecycle)
         _render_sprint_completion_capability(lifecycle)
+    elif stage == SPRINT_PLAN:
+        _render_sprint_planning_stage(lifecycle)
     else:
         st.info(
             "{} is not implemented yet. Nothing here generates an artifact.".format(
@@ -4559,6 +4703,8 @@ def _render_lifecycle_workspace() -> None:
         test_cases=test_cases_data,
         test_cases_approved=bool(st.session_state.get(TEST_CASES_APPROVED_SESSION_KEY)),
         delivery_mapping=st.session_state.get(_skey(JIRA_STATE_NAME, "delivery_mapping")),
+        sprint_plan=st.session_state.get(SPRINT_PLAN_SESSION_KEY),
+        sprint_plan_approved=bool(st.session_state.get(SPRINT_PLAN_APPROVED_SESSION_KEY)),
     )
     for position, stage in enumerate(LIFECYCLE_STAGES, start=1):
         st.markdown(
