@@ -15,6 +15,7 @@ class SprintPlan:
     sprint_goal: str = ""
     duration_weeks: int = 4
     issues: list = field(default_factory=list)
+    approved: bool = False  # New flag to enforce sprint approval before execution
 
     @property
     def selected_issues(self):
