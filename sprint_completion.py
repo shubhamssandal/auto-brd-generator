@@ -10,6 +10,8 @@ backlog, and recommends the next sprint using existing recommendation logic.
 import logging
 from typing import List, Optional, Dict, Any
 
+import streamlit as st
+
 from lifecycle_models import ProjectLifecycle, StageState
 from sprint_completion_models import (
     StoryCompletion,
