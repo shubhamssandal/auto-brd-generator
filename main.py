@@ -4009,6 +4009,55 @@ def _render_sprint_planning_stage(lifecycle) -> None:
             sprint_plan.approved = False
             _persist_sprint_plan(sprint_plan)
             _flash("info", "Sprint approval revoked. The sprint is pending review again.")
+        # Run Sprint Execution button (only shown when sprint is approved)
+        if st.button("Run Sprint Execution", key="run_sprint_execution"):
+            with st.spinner("Running sprint execution..."):
+                from sprint_execution import execute_sprint
+                # Execute the sprint using the approved sprint plan
+                sprint_result = execute_sprint(
+                    sprint_plan=sprint_plan,
+                    lifecycle=lifecycle,
+                    client=CLIENT,  # Use the global Gemini client
+                    workspace_root=os.getcwd(),  # Use current workspace
+                )
+                st.session_state.sprint_execution_result = sprint_result
+                st.session_state.sprint_execution_run = True
+                st.rerun()
+
+        # Display sprint execution results if available
+        if st.session_state.get("sprint_execution_run") and st.session_state.get("sprint_execution_result"):
+            result = st.session_state.sprint_execution_result
+            st.markdown("### Sprint Execution Results")
+            if result.blocked_stories > 0 or result.failed_stories > 0:
+                st.error(f"**Sprint Execution Blocked:** {result.blocked_stories} blocked, {result.failed_stories} failed")
+            else:
+                st.success("**Sprint Execution Completed**")
+
+            st.markdown(f"**Stories Completed:** {result.completed_stories}/{result.total_stories}")
+            st.markdown(f"**Total Fix Attempts:** {result.total_fix_attempts}")
+
+            if result.files_changed:
+                st.markdown("**Files Changed:**")
+                for change in result.files_changed:
+                    if change.change_type == "created":
+                        st.markdown(f"- ✅ **{change.file_path}** (created)")
+                    else:
+                        st.markdown(f"- 🔄 **{change.file_path}** (modified)")
+            else:
+                st.markdown("**Files Changed:** None")
+
+            if result.test_suites:
+                st.markdown("**Test Results:**")
+                for suite in result.test_suites:
+                    for tc in suite.test_cases:
+                        st.markdown(f"- **{tc.test_id}**: {tc.scenario} ({tc.execution_status})")
+            else:
+                st.markdown("**Test Results:** None")
+
+            if result.blockers:
+                st.markdown("**Blockers:**")
+                for blocker in result.blockers:
+                    st.markdown(f"- {blocker}")
         return
 
     st.caption(
