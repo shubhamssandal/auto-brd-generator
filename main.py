@@ -4019,6 +4019,7 @@ def _render_sprint_planning_stage(lifecycle) -> None:
                     lifecycle=lifecycle,
                     client=CLIENT,  # Use the global Gemini client
                     workspace_root=os.getcwd(),  # Use current workspace
+                    model_name=GEMINI_MODEL,
                 )
                 st.session_state.sprint_execution_result = sprint_result
                 st.session_state.sprint_execution_run = True
