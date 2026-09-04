@@ -7,6 +7,43 @@ from typing import Optional
 import streamlit as st
 from dotenv import load_dotenv
 
+# Import refactored session state helpers
+import session_state_helpers
+
+# Alias session state helper functions to maintain compatibility with existing calls
+_skey = session_state_helpers._skey
+_clear_prd_widgets = session_state_helpers._clear_prd_widgets
+_clear_sprint_plan_state = session_state_helpers._clear_sprint_plan_state
+_held_sprint_plan = session_state_helpers._held_sprint_plan
+_persist_sprint_plan = session_state_helpers._persist_sprint_plan
+_clear_test_cases_state = session_state_helpers._clear_test_cases_state
+_clear_test_execution_state = session_state_helpers._clear_test_execution_state
+_held_test_execution = session_state_helpers._held_test_execution
+_persist_test_execution = session_state_helpers._persist_test_execution
+_clear_implementation_plan_state = session_state_helpers._clear_implementation_plan_state
+_clear_architecture_state = session_state_helpers._clear_architecture_state
+_clear_prd_state = session_state_helpers._clear_prd_state
+_clear_jira_plan_review_widgets = session_state_helpers._clear_jira_plan_review_widgets
+_disconnect = session_state_helpers._disconnect
+_clear_jira_project_state = session_state_helpers._clear_jira_project_state
+_store_brd = session_state_helpers._store_brd
+_held_brd = session_state_helpers._held_brd
+_held_prd = session_state_helpers._held_prd
+_persist_prd = session_state_helpers._persist_prd
+_held_architecture = session_state_helpers._held_architecture
+_persist_architecture = session_state_helpers._persist_architecture
+_held_implementation_plan = session_state_helpers._held_implementation_plan
+_persist_implementation_plan = session_state_helpers._persist_implementation_plan
+_held_test_cases = session_state_helpers._held_test_cases
+_persist_test_cases = session_state_helpers._persist_test_cases
+_brd_approved = session_state_helpers._brd_approved
+_prd_approved = session_state_helpers._prd_approved
+_architecture_approved = session_state_helpers._architecture_approved
+_implementation_plan_approved = session_state_helpers._implementation_plan_approved
+_test_cases_approved = session_state_helpers._test_cases_approved
+_test_execution_approved = session_state_helpers._test_execution_approved
+_sprint_plan_approved = session_state_helpers._sprint_plan_approved
+
 from google import genai
 from google.genai import types
 from brd_models import (
@@ -759,206 +796,9 @@ SPRINT_PLAN_GENERATED_KEY = "sprint_plan_generated"
 _SPRINT_WIDGET_PREFIX = "sprint_plan_review__"
 
 
-def _clear_prd_widgets() -> None:
-    """Drop PRD review-editor widget state."""
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_PRD_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-
-
-def _clear_sprint_plan_state() -> None:
-    """
-    Forget the generated sprint plan, its approval and its editors.
-
-    Called when the implementation plan changes for the same reason downstream stages
-    are cleared when their upstream artifact changes: a sprint plan is a planning of one
-    specific implementation plan, so a new plan makes a held sprint plan wrong rather
-    than merely old, and its approval cannot carry over.
-    """
-    for key in (
-        SPRINT_PLAN_SESSION_KEY,
-        SPRINT_PLAN_APPROVED_SESSION_KEY,
-        SPRINT_PLAN_GENERATED_KEY,
-    ):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_SPRINT_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-
-
-def _held_sprint_plan():
-    plan = st.session_state.get(SPRINT_PLAN_SESSION_KEY)
-    return plan if isinstance(plan, SprintPlan) else None
-
-
-def _persist_sprint_plan(plan: SprintPlan) -> SprintPlan:
-    st.session_state[SPRINT_PLAN_SESSION_KEY] = plan
-    return plan
-
-
-def _clear_test_cases_state() -> None:
-    """
-    Forget the test cases, their approval, and their review editors.
-    """
-    for key in (
-        TEST_CASES_SESSION_KEY,
-        TEST_CASES_APPROVED_SESSION_KEY,
-    ):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_TEST_CASES_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-
-
-def _clear_test_execution_state() -> None:
-    """
-    Forget the test execution data, their approval, and their review editors.
-    """
-    for key in (
-        TEST_EXECUTION_SESSION_KEY,
-        TEST_EXECUTION_APPROVED_SESSION_KEY,
-    ):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_TEST_EXECUTION_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-
-
-def _held_test_execution():
-    test_execution = st.session_state.get(TEST_EXECUTION_SESSION_KEY)
-    return test_execution if isinstance(test_execution, (list, tuple)) else None
-
-
-def _persist_test_execution(test_execution) -> list:
-    st.session_state[TEST_EXECUTION_SESSION_KEY] = test_execution
-    return test_execution
-
-
-def _clear_implementation_plan_state() -> None:
-    """
-    Forget the implementation plan, its approval and its editors.
-
-    Called when the architecture changes, for the reason the architecture is cleared when
-    the PRD changes: a plan decomposes one specific design, so a new design makes a held
-    plan wrong rather than merely old, and its approval cannot carry over to work nobody
-    has reviewed.
-    """
-    for key in (
-        IMPLEMENTATION_PLAN_SESSION_KEY,
-        IMPLEMENTATION_PLAN_APPROVED_SESSION_KEY,
-    ):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_PLAN_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-    _clear_test_cases_state()
-    _clear_sprint_plan_state()
-
-
-def _clear_architecture_state() -> None:
-    """
-    Forget the architecture, its approval and its editors.
-
-    Called when the PRD changes for the same reason ``_clear_prd_state`` is called when
-    the BRD changes: an architecture is the design for one specific PRD, so a new PRD
-    makes a held architecture wrong rather than merely old. The implementation plan
-    decomposed from that architecture goes with it.
-    """
-    for key in (
-        ARCHITECTURE_SESSION_KEY,
-        ARCHITECTURE_APPROVED_SESSION_KEY,
-        ARCHITECTURE_DISCUSSION_SESSION_KEY,
-    ):
-        st.session_state.pop(key, None)
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_ARCH_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-    _clear_implementation_plan_state()
-    _clear_test_cases_state()
-
-
-def _clear_prd_state() -> None:
-    """
-    Forget the PRD, its approval and its editors.
-
-    Called when the BRD changes: a PRD is a product definition of one specific BRD, so
-    a new BRD makes a held PRD wrong rather than merely old, and its approval cannot
-    carry over to a document nobody has reviewed. The architecture derived from that PRD
-    goes with it.
-    """
-    for key in (PRD_SESSION_KEY, PRD_APPROVED_SESSION_KEY, PRD_REFINEMENT_SESSION_KEY):
-        st.session_state.pop(key, None)
-    _clear_prd_widgets()
-    _clear_architecture_state()
-
-
-# Streamlit widget keys for the work-plan review editors. Not under ``jira__``:
-# those suffixes are plan data, and a leftover text-input value would otherwise
-# outlive the plan it described.
-_JIRA_REVIEW_WIDGET_PREFIX = "jira_review__"
-
-
-def _clear_jira_plan_review_widgets() -> None:
-    """Drop review-editor widget state so a new or absent plan cannot inherit it."""
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(_JIRA_REVIEW_WIDGET_PREFIX):
-            st.session_state.pop(key, None)
-
-
-def _disconnect(provider) -> None:
-    """Drop every trace of the provider session from this browser session."""
-    suffixes = ("tokens", "handshake", "discovery", "transcript", "identity", "sites", "site")
-    for suffix in suffixes + _JIRA_PROJECT_SUFFIXES:
-        st.session_state.pop(_skey(provider.name, suffix), None)
-    _clear_jira_plan_review_widgets()
-
-
-def _clear_jira_project_state(service) -> None:
-    """
-    Forget the project list, the project selection and its metadata.
-
-    The picker's own widget state goes too: a shorter new list would leave a
-    stored index pointing past the end of it.
-    """
-    for suffix in _JIRA_PROJECT_SUFFIXES:
-        st.session_state.pop(_skey(service.name, suffix), None)
-    st.session_state.pop("select_jira_project", None)
-    _clear_jira_plan_review_widgets()
-
-
-# Session-state namespace for Jira. Spelled once so the work-plan panel can address
-# its own keys without being handed the service object: with no service and no token
-# in scope, that panel has no way to reach Jira at all.
-JIRA_STATE_NAME = JiraService().name
-
-
-def _store_brd(brd_data: BRDData, source: str = "") -> None:
-    """
-    Keep the generated BRD for the optional Jira step.
-
-    Required because every button click re-runs this script: by the time a
-    "Generate Jira Work Plan" click is handled, the run that produced the BRD is
-    over and its local variable is gone. Nothing else about BRD generation,
-    validation, display or export changes.
-
-    A plan built from the previous BRD is dropped rather than left behind. A work
-    plan is a proposal about one specific BRD, so a newly generated BRD makes a
-    cached plan wrong, not merely old. The same applies to a PRD and to any approval
-    recorded against the BRD that has just been replaced.
-    """
-    st.session_state[BRD_SESSION_KEY] = brd_data
-    st.session_state[BRD_SOURCE_SESSION_KEY] = str(source or "")
-    st.session_state.pop(BRD_APPROVED_SESSION_KEY, None)
-    _clear_prd_state()
-    for suffix in (
-        "plan",
-        "plan_for",
-        "created",
-        "creating",
-        "confirm_create",
-    ):
-        st.session_state.pop(_skey(JIRA_STATE_NAME, suffix), None)
-    _clear_jira_plan_review_widgets()
+# NOTE: Session state helper functions have been moved to session_state_helpers.py
+# Import session state helpers and access them via session_state_helpers.<function_name>
+import session_state_helpers
 
 
 def _handle_oauth_callback() -> None:
@@ -2484,20 +2324,6 @@ def _render_jira_section() -> None:
 # --- Project lifecycle workspace ---
 
 
-def _brd_approved() -> bool:
-    """Whether the reviewer approved the BRD held in this session."""
-    return bool(st.session_state.get(BRD_APPROVED_SESSION_KEY))
-
-
-def _held_prd():
-    """The PRD this session holds, or ``None``."""
-    prd = st.session_state.get(PRD_SESSION_KEY)
-    return prd if isinstance(prd, PRDData) else None
-
-
-def _persist_prd(prd: PRDData) -> PRDData:
-    st.session_state[PRD_SESSION_KEY] = prd
-    return prd
 
 
 def _render_brd_approval() -> None:
@@ -2837,18 +2663,6 @@ def _render_prd_stage(lifecycle) -> None:
         _flash("success", "PRD approved. The architecture can now be generated from it.")
 
 
-def _prd_approved() -> bool:
-    return bool(st.session_state.get(PRD_APPROVED_SESSION_KEY))
-
-
-def _held_architecture():
-    architecture = st.session_state.get(ARCHITECTURE_SESSION_KEY)
-    return architecture if isinstance(architecture, ArchitectureData) else None
-
-
-def _persist_architecture(architecture: ArchitectureData) -> ArchitectureData:
-    st.session_state[ARCHITECTURE_SESSION_KEY] = architecture
-    return architecture
 
 
 def _architecture_discussion() -> Optional[NormalizedTranscript]:
@@ -3205,29 +3019,8 @@ def _render_architecture_stage(lifecycle) -> None:
         _flash("success", "Architecture approved.")
 
 
-def _architecture_approved() -> bool:
-    return bool(st.session_state.get(ARCHITECTURE_APPROVED_SESSION_KEY))
 
 
-def _held_implementation_plan():
-    plan = st.session_state.get(IMPLEMENTATION_PLAN_SESSION_KEY)
-    return plan if isinstance(plan, ImplementationPlan) else None
-
-
-def _persist_implementation_plan(plan: ImplementationPlan) -> ImplementationPlan:
-    st.session_state[IMPLEMENTATION_PLAN_SESSION_KEY] = plan
-    _clear_test_cases_state()
-    return plan
-
-
-def _held_test_cases():
-    test_cases = st.session_state.get(TEST_CASES_SESSION_KEY)
-    return test_cases if isinstance(test_cases, (list, tuple)) else None
-
-
-def _persist_test_cases(test_cases) -> list:
-    st.session_state[TEST_CASES_SESSION_KEY] = test_cases
-    return test_cases
 
 
 def _render_plan_traceability(
