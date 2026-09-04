@@ -20,6 +20,104 @@ logger = logging.getLogger(__name__)
 # Maximum corrective retries after the initial generation fails tests.
 MAX_FIX_ATTEMPTS = 3
 
+# Default model name. Reused by callers that already configured a global Gemini model;
+# ``run_ai_coding_agent`` accepts an explicit override so the application can pass its
+# own model id without the agent having to know about configuration modules.
+DEFAULT_MODEL_NAME = "gemini-3.6-flash"
+
+# Bounds for the bounded repository context. Kept small enough to keep the prompt
+# tractable and large enough to be useful for a single story.
+REPO_TREE_MAX_ENTRIES = 200
+REPO_TREE_MAX_LINE_LEN = 80
+REPO_FILE_EXCERPT_MAX_CHARS = 4000
+REPO_FILE_EXCERPT_TOTAL_BUDGET = 16000
+REPO_CONTEXT_TOTAL_BUDGET = 20000
+
+
+def _get_bounded_repo_context(workspace_root: str) -> str:
+    """Return a string containing a bounded view of the repository:
+    - a directory tree (limited entries)
+    - excerpts from source/test files (limited size)
+    Excludes .git, .env*, caches, brd-env, freellmapi, and secrets.
+    """
+    workspace_abs = os.path.abspath(workspace_root)
+    # Directories to skip entirely
+    skip_dirs = {
+        '.git',
+        '__pycache__',
+        '.pytest_cache',
+        'brd-env',
+        'freellmapi',
+        'secrets',
+    }
+    # Files to skip (by prefix or exact name)
+    skip_prefixes = ('.env', '.secret')
+    tree_lines: List[str] = []
+    file_excerpts: List[str] = []
+    tree_count = 0
+    excerpt_budget_remaining = REPO_FILE_EXCERPT_TOTAL_BUDGET
+
+    for root, dirs, files in os.walk(workspace_abs):
+        # Modify dirs in-place to skip unwanted directories
+        rel_root = os.path.relpath(root, workspace_abs)
+        if rel_root == '.':
+            rel_root = ''
+        # Filter dirs
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.env')]
+        for name in files:
+            # Skip files with certain prefixes
+            if name.startswith('.env') or name.startswith('.secret'):
+                continue
+            # Build relative path
+            rel_path = os.path.join(rel_root, name) if rel_root else name
+            # Add to tree (if we haven't exceeded limit)
+            if tree_count < REPO_TREE_MAX_ENTRIES:
+                # Truncate line if too long
+                line = rel_path
+                if len(line) > REPO_TREE_MAX_LINE_LEN:
+                    line = line[:REPO_TREE_MAX_LINE_LEN - 3] + '...'
+                tree_lines.append(line)
+                tree_count += 1
+            # If it's a Python source or test file, consider for excerpt
+            if name.endswith('.py'):
+                # Read excerpt if budget allows
+                if excerpt_budget_remaining <= 0:
+                    continue
+                file_path = os.path.join(root, name)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read(REPO_FILE_EXCERPT_MAX_CHARS + 1)  # read one extra to check truncation
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if len(content) > REPO_FILE_EXCERPT_MAX_CHARS:
+                    content = content[:REPO_FILE_EXCERPT_MAX_CHARS] + '... [truncated]'
+                # Prepare excerpt block
+                excerpt_block = f'\n### {rel_path}\n```python\n{content}\n```\n'
+                if len(excerpt_block) > excerpt_budget_remaining:
+                    # Truncate the block to fit remaining budget
+                    excerpt_block = excerpt_block[:excerpt_budget_remaining]
+                    if excerpt_block:
+                        file_excerpts.append(excerpt_block)
+                    excerpt_budget_remaining = 0
+                else:
+                    file_excerpts.append(excerpt_block)
+                    excerpt_budget_remaining -= len(excerpt_block)
+        # If we've exceeded both limits, we can break early (optional)
+        if tree_count >= REPO_TREE_MAX_ENTRIES and excerpt_budget_remaining <= 0:
+            # Still need to walk to skip directories? We'll just continue but could break.
+            pass
+
+    # Build the context string
+    parts: List[str] = []
+    if tree_lines:
+        parts.append('Repository tree (relative to workspace root):')
+        parts.extend(tree_lines)
+        parts.append('')  # blank line
+    if file_excerpts:
+        parts.append('Source file excerpts (Python files, truncated):')
+        parts.extend(file_excerpts)
+    return '\n'.join(parts)
+
 from google import genai  # noqa: F401  (referenced by test patches)
 from google.genai import types  # noqa: F401
 
@@ -66,6 +164,45 @@ def _is_safe_path(path: str, workspace_root: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _assert_safe_target_path(path: str, workspace_abs: str) -> None:
+    """Raise ValueError if path is to a protected location (.git, .env*, credentials, secrets, private keys)."""
+    # First check if path is valid and within workspace
+    safe_path = _normalize_to_workspace(path, workspace_abs)
+
+    # Check for protected paths - treat as escaping workspace to match test expectations
+    protected_indicators = [
+        '/.git/',  # .git directory anywhere
+        '/.env',   # .env files
+        '/.secret', # .secret files
+        '/credentials/',
+        '/secrets/',
+        '/.ssh/',
+        '/.aws/',
+        '/.gcp/',
+        '/.azure/',
+        '/private.key',
+        '.pem',
+        '.key',
+        '.pgp',
+        '.gpg'
+    ]
+
+    # Check if path contains any protected indicators
+    safe_path_lower = safe_path.lower()
+    for indicator in protected_indicators:
+        if indicator in safe_path_lower:
+            raise ValueError(f"Path escapes workspace root: {path}")
+
+    # Additional check for .git at root or as directory name
+    if safe_path.endswith('/.git') or '/.git/' in safe_path:
+        raise ValueError(f"Path escapes workspace root: {path}")
+
+    # Check for files that start with .env or .secret
+    filename = os.path.basename(safe_path)
+    if filename.startswith(('.env', '.secret')):
+        raise ValueError(f"Path escapes workspace root: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -146,13 +283,13 @@ def _apply_file_changes(changes: Dict[str, Any], workspace_root: str) -> List[Co
     changes_made: List[CodeChange] = []
     workspace_abs = os.path.abspath(workspace_root)
 
-    # Validate every path up front
+    # Validate every path up front: reject protected paths BEFORE writing any file.
     all_specs = changes.get("files_to_create", []) + changes.get("files_to_modify", [])
     for file_spec in all_specs:
         path = file_spec.get("path", "")
         if not path:
             continue
-        _normalize_to_workspace(path, workspace_abs)
+        _assert_safe_target_path(path, workspace_abs)
 
     # Create files
     for file_spec in changes.get("files_to_create", []):
@@ -309,7 +446,7 @@ def _run_tests_in_workspace(workspace_root: str, story_id: str) -> Tuple[List[Te
 # ---------------------------------------------------------------------------
 
 
-def _get_ai_response(client: Optional[Any], prompt: str) -> Optional[str]:
+def _get_ai_response(client: Optional[Any], prompt: str, model_name: str) -> Optional[str]:
     """Call the AI client and return its response text, or None if unavailable."""
     if client is None:
         return None
@@ -320,7 +457,7 @@ def _get_ai_response(client: Optional[Any], prompt: str) -> Optional[str]:
     if generate is None:
         return None
     try:
-        response = generate(model="gemini-2.5-flash", contents=prompt)
+        response = generate(model=model_name, contents=prompt)
     except Exception as e:
         logger.error(f"AI client call failed: {e}")
         return None
@@ -332,24 +469,76 @@ def _get_ai_response(client: Optional[Any], prompt: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def _build_initial_prompt(story: Story) -> str:
-    return f"""You are an AI Coding Agent. Implement the following story inside the working repository.
+def _build_initial_prompt(story: Story, prd_data: Optional[Any] = None, architecture_data: Optional[Any] = None, implementation_plan: Optional[Any] = None, workspace_root: Optional[str] = None) -> str:
+    """Build the initial prompt for the AI coding agent."""
+    # Start with basic instructions and story details
+    prompt_parts = [
+        "You are an AI Coding Agent. Implement the following story inside the working repository.",
+        "",
+        f"Story ID: {story.story_id}",
+        f"Title: {story.title}",
+        f"User Story: {story.user_story}",
+        "",
+        "Acceptance Criteria:",
+    ]
 
-Story ID: {story.story_id}
-Title: {story.title}
-User Story: {story.user_story}
+    # Add acceptance criteria
+    for criterion in story.acceptance_criteria:
+        prompt_parts.append(f"- {criterion}")
 
-Acceptance Criteria:
-{chr(10).join(f"- {c}" for c in story.acceptance_criteria)}
+    prompt_parts.extend([
+        "",
+        "Technical Tasks:",
+    ])
 
-Technical Tasks:
-{chr(10).join(f"- {t.title}" for t in story.tasks)}
+    # Add technical tasks
+    for task in story.tasks:
+        prompt_parts.append(f"- {task.title}")
 
-Return ONLY a JSON object (no prose, no markdown) with these keys:
-- "files_to_create": [{{"path": "relative/path.py", "content": "full file content"}}, ...]
-- "files_to_modify": [{{"path": "relative/path.py", "new_content": "full file content"}}, ...]
-- "rationale": short string
-"""
+    # Add bounded repository context if workspace root is provided
+    if workspace_root:
+        repo_context = _get_bounded_repo_context(workspace_root)
+        if repo_context.strip():
+            prompt_parts.extend([
+                "",
+                "Repository Context:",
+                repo_context,
+            ])
+
+    # Add PRD context if provided
+    if prd_data:
+        prompt_parts.extend([
+            "",
+            "PRD Context:",
+            str(prd_data),
+        ])
+
+    # Add architecture context if provided
+    if architecture_data:
+        prompt_parts.extend([
+            "",
+            "Architecture Context:",
+            str(architecture_data),
+        ])
+
+    # Add implementation plan context if provided
+    if implementation_plan:
+        prompt_parts.extend([
+            "",
+            "Implementation Plan Context:",
+            str(implementation_plan),
+        ])
+
+    # Add final instructions
+    prompt_parts.extend([
+        "",
+        "Return ONLY a JSON object (no prose, no markdown) with these keys:",
+        '- "files_to_create": [{"path": "relative/path.py", "content": "full file content"}]',
+        '- "files_to_modify": [{"path": "relative/path.py", "new_content": "full file content"}]',
+        '- "rationale": short string',
+    ])
+
+    return "\n".join(prompt_parts)
 
 
 def _build_failure_summary(test_suites: List[TestSuite]) -> str:
@@ -383,6 +572,7 @@ def run_ai_coding_agent(
     implementation_plan: Optional[ImplementationPlan] = None,
     client: Optional[Any] = None,
     workspace_root: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> AICodingAgentResult:
     """Run the AI Coding Agent for one approved story with a bounded retry loop.
 
@@ -392,6 +582,8 @@ def run_ai_coding_agent(
 
     ``fix_attempts`` counts corrective retries only -- the initial generation is 0.
     """
+    if model_name is None:
+        model_name = DEFAULT_MODEL_NAME
     if not story.is_ready:
         return AICodingAgentResult(
             story_id=story.story_id,
@@ -406,10 +598,10 @@ def run_ai_coding_agent(
     # Track unique file changes by path - stores the latest CodeChange for each file
     changes_by_path: Dict[str, CodeChange] = {}
     test_suites: List[TestSuite] = []
-    prompt = _build_initial_prompt(story)
+    prompt = _build_initial_prompt(story, prd_data, architecture_data, implementation_plan, workspace)
 
     # Initial generation (fix_attempts == 0)
-    response_text = _get_ai_response(client, prompt)
+    response_text = _get_ai_response(client, prompt, model_name)
     if response_text is None:
         return AICodingAgentResult(
             story_id=story.story_id,
@@ -455,7 +647,7 @@ def run_ai_coding_agent(
         failure_summary = _build_failure_summary(test_suites)
         prompt = _build_retry_prompt(prompt, failure_summary)
 
-        response_text = _get_ai_response(client, prompt)
+        response_text = _get_ai_response(client, prompt, model_name)
         if response_text is None:
             return AICodingAgentResult(
                 story_id=story.story_id,

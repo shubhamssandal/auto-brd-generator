@@ -139,8 +139,12 @@ def execute_sprint(
                 # Execute this story using the existing AI Coding Agent
                 story_result = run_ai_coding_agent(
                     story=story,
+                    prd_data=getattr(lifecycle, 'prd', None),
+                    architecture_data=getattr(lifecycle, 'architecture', None),
+                    implementation_plan=getattr(lifecycle, 'implementation_plan', None),
                     client=client,
                     workspace_root=workspace,
+                    model_name=getattr(lifecycle, 'model_name', None),
                 )
 
                 # Update sprint result with story-level evidence

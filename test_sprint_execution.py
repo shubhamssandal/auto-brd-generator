@@ -501,3 +501,49 @@ def test_existing_successful_behavior_still_passes(workspace):
     assert len(res.files_changed) == 1
     # Per-story outcome is recorded
     assert lifecycle.story_execution_outcomes["S1"]["completed"] is True
+
+
+def test_sprint_execution_passes_context_and_model_to_coding_agent(workspace):
+    """Test that sprint execution passes PRD, architecture, implementation plan, and model_name to the coding agent."""
+    # Create a simple implementation plan with one story
+    plan = ImplementationPlan(stories=[
+        Story(story_id="S1", title="Task", user_story="U", acceptance_criteria=("A",), tasks=(TechnicalTask(task_id="T1", title="T"),), component_ids=("c1",), feature_ids=("f1",))
+    ])
+    # Sprint with one issue
+    sprint = SimpleSprintPlan(issues=[Mock(issue_key="I1", story_id="S1", is_selected=True)], approved=True)
+    # Lifecycle with PRD, architecture, implementation plan, and model_name
+    lifecycle = SimpleLifecycle(plan)
+    lifecycle.prd = "PRD content"
+    lifecycle.architecture = "Architecture content"
+    lifecycle.implementation_plan = plan
+    lifecycle.model_name = "test-model-123"
+
+    # Mock the coding agent to capture arguments
+    captured_args = {}
+    def capture_args(**kwargs):
+        captured_args.update(kwargs)
+        return AICodingAgentResult(
+            story_id=kwargs.get('story').story_id if kwargs.get('story') else "S1",
+            files_changed=[],
+            test_suites=[],
+            fix_attempts=0,
+            blocked=False,
+            evidence_generated=True
+        )
+
+    with patch('sprint_execution.run_ai_coding_agent', side_effect=capture_args):
+        res = execute_sprint(sprint, lifecycle, workspace_root=workspace)
+
+    # Verify the coding agent was called
+    assert captured_args, "run_ai_coding_agent was not called"
+    # Verify the story was passed
+    assert 'story' in captured_args
+    assert captured_args['story'].story_id == "S1"
+    # Verify PRD, architecture, implementation plan, and model_name were passed
+    assert captured_args.get('prd_data') == "PRD content"
+    assert captured_args.get('architecture_data') == "Architecture content"
+    assert captured_args.get('implementation_plan') == plan
+    assert captured_args.get('model_name') == "test-model-123"
+    # Verify the sprint execution succeeded
+    assert res.completed_stories == 1
+    assert res.overall_status == "Completed"
