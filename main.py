@@ -43,6 +43,8 @@ _implementation_plan_approved = session_state_helpers._implementation_plan_appro
 _test_cases_approved = session_state_helpers._test_cases_approved
 _test_execution_approved = session_state_helpers._test_execution_approved
 _sprint_plan_approved = session_state_helpers._sprint_plan_approved
+JIRA_STATE_NAME = session_state_helpers.JIRA_STATE_NAME
+_JIRA_REVIEW_WIDGET_PREFIX = session_state_helpers._JIRA_REVIEW_WIDGET_PREFIX
 
 from google import genai
 from google.genai import types
@@ -4220,8 +4222,10 @@ def _render_test_cases_stage(lifecycle) -> None:
             try:
                 generated = generate_test_suite(plan, client=CLIENT)
             except Exception:
+                generated = None
+            # If we got no test cases at all (i.e., all suites are empty), use the fallback
+            if generated is None or (generated and all(not suite.test_cases for suite in generated)):
                 generated = _fallback_test_suite(plan)
-            if not generated:
                 generated = _fallback_test_suite(plan)
             test_cases = _persist_test_cases(generated)
 
@@ -4515,9 +4519,8 @@ def _render_lifecycle_workspace() -> None:
     st.subheader("Project delivery lifecycle")
     st.caption(
         "The delivery flow this project is being built towards. Discovery → BRD, "
-        "Product Definition → PRD, Architecture, Implementation Plan and the Jira "
-        "delivery stage are implemented; the stages between them are navigable and "
-        "report that they are not implemented yet."
+        "Product Definition → PRD, Architecture, Implementation Plan, Sprint Planning, "
+        "Test Cases, Test Execution and the Jira delivery stage are implemented."
     )
 
     brd_data = st.session_state.get(BRD_SESSION_KEY)
