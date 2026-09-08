@@ -1,11 +1,14 @@
 import os
 import json
 import logging
+import time
+import random
 from dataclasses import replace
 from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
+from google.api_core.exceptions import ServiceUnavailable, InternalServerError, BadGateway, GatewayTimeout, TooManyRequests
 
 # Import refactored session state helpers
 import session_state_helpers
@@ -165,18 +168,44 @@ logger = logging.getLogger(__name__)
 def _gemini_json(prompt: str) -> str:
     """
     Send one prompt to the configured model and return its response text.
+    Implements exponential backoff with jitter for transient errors.
 
     Exists so the Jira planner can be handed a model call as a plain ``str -> str``
     function. ``jira_planner`` therefore holds no client, no API key and no import of
     this module: it cannot reach the network by itself, and it can be tested without a
     live model. Requires ``CLIENT``; callers check that through ``_planner_generate``.
     """
-    response = CLIENT.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    return response.text or ""
+    max_retries = 3
+    base_delay = 1.0  # seconds
+    max_delay = 10.0  # seconds
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = CLIENT.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            return response.text or ""
+        except (ServiceUnavailable, InternalServerError, BadGateway, GatewayTimeout, TooManyRequests) as e:
+            if attempt == max_retries:
+                logger.error(f"Gemini API request failed after {max_retries} retries: {e}")
+                raise
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            # Add jitter: random value between 0 and delay * 0.1
+            jitter = random.uniform(0, delay * 0.1)
+            total_delay = delay + jitter
+            logger.warning(
+                f"Transient Gemini API error (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                f"Retrying in {total_delay:.2f} seconds..."
+            )
+            time.sleep(total_delay)
+        except Exception as e:
+            # For non-transient errors, don't retry
+            logger.error(f"Non-transient Gemini API error: {e}")
+            raise
+    # This line is theoretically unreachable because we either return or raise in the loop
+    raise RuntimeError("Unexpected exit from retry loop")
 
 
 def _planner_generate():
@@ -340,14 +369,8 @@ def generate_brd_from_notes(notes: str) -> BRDData:
     ---
     """
 
-    response = CLIENT.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        ),
-    )
-    data = json.loads(response.text)
+    response_text = _gemini_json(prompt)
+    data = json.loads(response_text)
     
     return validate_and_create_brd_data(data, notes)
 
