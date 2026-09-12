@@ -49,9 +49,13 @@ def _get_bounded_repo_context(workspace_root: str) -> str:
         'brd-env',
         'freellmapi',
         'secrets',
+        '.ssh',
+        '.aws',
+        '.gcp',
+        '.azure',
     }
     # Files to skip (by prefix or exact name)
-    skip_prefixes = ('.env', '.secret')
+    skip_prefixes = ('.env', '.secret', 'private.key', 'id_rsa')
     tree_lines: List[str] = []
     file_excerpts: List[str] = []
     tree_count = 0
@@ -63,10 +67,10 @@ def _get_bounded_repo_context(workspace_root: str) -> str:
         if rel_root == '.':
             rel_root = ''
         # Filter dirs
-        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.env')]
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
         for name in files:
             # Skip files with certain prefixes
-            if name.startswith('.env') or name.startswith('.secret'):
+            if name.startswith(skip_prefixes) or name in ('private.key',):
                 continue
             # Build relative path
             rel_path = os.path.join(rel_root, name) if rel_root else name
