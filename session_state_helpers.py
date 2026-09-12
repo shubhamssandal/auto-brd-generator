@@ -96,6 +96,10 @@ _JIRA_REVIEW_WIDGET_PREFIX = "jira_review__"
 JIRA_STATE_NAME = "jira"  # JiraService().name would create instance, so hardcode
 
 
+# Session state key for uploaded transcript
+UPLOADED_TRANSCRIPT_KEY = "uploaded_transcript"
+
+
 def _skey(provider_name: str, suffix: str) -> str:
     """Namespaced session-state key for one provider."""
     return f"{provider_name}__{suffix}"
@@ -116,7 +120,8 @@ def _clear_sprint_plan_state() -> None:
     Called when the implementation plan changes for the same reason downstream stages
     are cleared when their upstream artifact changes: a sprint plan is a planning of one
     specific implementation plan, so a new plan makes a held sprint plan wrong rather
-    than merely old, and its approval cannot carry over.
+    than merely old, and its approval cannot carry over to work nobody
+    has reviewed.
     """
     import streamlit as st
     for key in (
@@ -211,9 +216,9 @@ def _clear_architecture_state() -> None:
     Forget the architecture, its approval and its editors.
 
     Called when the PRD changes for the same reason ``_clear_prd_state`` is called when
-    the BRD changes: an architecture is the design for one specific PRD, so a new PRD
-    makes a held architecture wrong rather than merely old. The implementation plan
-    decomposed from that architecture goes with it.
+    the PRD is a product definition of one specific BRD, so a new BRD makes a held PRD wrong
+    rather than merely old, and its approval cannot carry over to a document nobody has
+    reviewed. The architecture derived from that PRD goes with it.
     """
     import streamlit as st
     for key in (
@@ -410,3 +415,27 @@ def _sprint_plan_approved() -> bool:
     """Whether the reviewer approved the sprint plan held in this session."""
     import streamlit as st
     return bool(st.session_state.get(SPRINT_PLAN_APPROVED_SESSION_KEY))
+
+
+def store_uploaded_transcript(uploaded_file) -> Any:
+    """
+    Store an uploaded transcript file in session state.
+
+    Takes an uploaded file object (as from st.file_uploader),
+    normalizes it using the real normalize_uploaded_file function,
+    stores the resulting NormalizedTranscript in session state
+    under UPLOADED_TRANSCRIPT_KEY, and returns the transcript.
+
+    This is the real application boundary: UploadedFile → normalize → session state.
+    """
+    import streamlit as st
+    from transcript_processor import normalize_uploaded_file
+
+    # Normalize the uploaded file using the real function
+    transcript = normalize_uploaded_file(uploaded_file)
+
+    # Store the result in the real session state
+    st.session_state[UPLOADED_TRANSCRIPT_KEY] = transcript
+
+    # Return the transcript for immediate use if needed
+    return transcript
