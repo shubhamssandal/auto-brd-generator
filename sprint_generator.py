@@ -204,3 +204,60 @@ def recommend_sprint(
                 is_selected=(i < 3)  # Select first 3 as selected
             ))
     return sprint
+
+
+def generate_sprint_plan_from_implementation_plan(
+    implementation_plan,
+    delivery_mapping: Optional[DeliveryMapping] = None,
+    sprint_name: str = "Sprint 1",
+    sprint_goal: str = "",
+    duration_weeks: int = 4,
+) -> SprintPlan:
+    """
+    Build a SprintPlan directly from an approved ImplementationPlan.
+
+    This is the lifecycle Sprint Planning stage: the source is the engineering structure
+    the reviewer approved, not a Jira backlog. Every story is mapped to a SprintIssue
+    with its ``story_id`` set so ``execute_sprint`` can resolve it against the
+    implementation plan. ``issue_key`` is preserved from the existing delivery mapping
+    where one exists, so a story that already became a Jira issue stays linked to it.
+
+    The returned plan always starts with ``approved = False``. Approval is a separate
+    human action handled by the lifecycle stage.
+    """
+    plan = SprintPlan(
+        sprint_name=sprint_name,
+        sprint_goal=sprint_goal,
+        duration_weeks=duration_weeks,
+        approved=False,
+    )
+
+    stories = getattr(implementation_plan, "stories", ()) or ()
+    if not stories:
+        return plan
+
+    ordered_ids = tuple(getattr(implementation_plan, "ordered_story_ids", ()) or ())
+    by_id = {story.story_id: story for story in stories}
+
+    for story_id in ordered_ids:
+        story = by_id.get(story_id)
+        if story is None:
+            continue
+        issue_key = ""
+        if isinstance(delivery_mapping, DeliveryMapping):
+            link = delivery_mapping.link_for(story_id)
+            if link is not None:
+                issue_key = link.issue_key
+        plan.issues.append(
+            SprintIssue(
+                issue_key=issue_key,
+                summary=getattr(story, "title", "") or "",
+                rationale=(
+                    f"Story {story.story_id} from approved implementation plan"
+                ),
+                is_selected=True,
+                story_id=story_id,
+            )
+        )
+
+    return plan

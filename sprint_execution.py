@@ -42,13 +42,14 @@ class SprintExecutionRunner:
         self.client = client
         self.workspace_root = workspace_root or os.getcwd()
 
-    def run_sprint(self, sprint_plan: Any, lifecycle: Any, client: Optional[Any] = None) -> SprintExecutionResult:
+    def run_sprint(self, sprint_plan: Any, lifecycle: Any, client: Optional[Any] = None, model_name: Optional[str] = None) -> SprintExecutionResult:
         """Run a sprint execution."""
         return execute_sprint(
             sprint_plan=sprint_plan,
             lifecycle=lifecycle,
             client=client or self.client,
             workspace_root=self.workspace_root,
+            model_name=model_name,
         )
 
     def approve_sprint(self, result: SprintExecutionResult) -> SprintExecutionResult:
@@ -65,6 +66,7 @@ def execute_sprint(
     lifecycle: Any,
     client: Optional[Any] = None,
     workspace_root: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> SprintExecutionResult:
     """Execute all stories in an approved sprint sequentially.
 
@@ -139,8 +141,12 @@ def execute_sprint(
                 # Execute this story using the existing AI Coding Agent
                 story_result = run_ai_coding_agent(
                     story=story,
+                    prd_data=getattr(lifecycle, 'prd', None),
+                    architecture_data=getattr(lifecycle, 'architecture', None),
+                    implementation_plan=getattr(lifecycle, 'implementation_plan', None),
                     client=client,
                     workspace_root=workspace,
+                    model_name=model_name or getattr(lifecycle, 'model_name', None),
                 )
 
                 # Update sprint result with story-level evidence
@@ -280,10 +286,11 @@ def run_sprint_and_collect_results(
     lifecycle: Any,
     client: Optional[Any] = None,
     workspace_root: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> SprintExecutionResult:
     """Run a sprint and return results with Jira integration."""
     runner = SprintExecutionRunner(client=client, workspace_root=workspace_root)
-    result = runner.run_sprint(sprint_plan, lifecycle)
+    result = runner.run_sprint(sprint_plan, lifecycle, model_name=model_name)
 
     # Record results in Jira if configured
     _sync_sprint_results_to_jira(lifecycle, result)

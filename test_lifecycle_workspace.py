@@ -29,6 +29,7 @@ from lifecycle_models import (
     NOT_STARTED,
     PENDING_REVIEW,
     PRD,
+    SPRINT_PLAN,
     STAGE_LABEL,
     TEST_CASES,
     TEST_EXECUTION,
@@ -66,6 +67,7 @@ def test_the_lifecycle_is_the_eight_stages_in_delivery_order():
         PRD,
         ARCHITECTURE,
         IMPLEMENTATION_PLAN,
+        SPRINT_PLAN,
         TEST_CASES,
         TEST_EXECUTION,
         DELIVERY_STATUS,
@@ -113,19 +115,9 @@ def test_a_generated_brd_is_pending_review_and_never_silently_approved():
     assert "google_meet" in discovery.detail
 
 
-def test_the_later_stages_report_that_they_are_not_implemented():
-    lifecycle = lifecycle_from(brd=a_brd())
-
-    later = [
-        stage
-        for stage in LIFECYCLE_STAGES
-        if stage not in IMPLEMENTED_STAGES
-    ]
-    assert later, "the lifecycle should have stages beyond the ones that are built"
-    for stage in later:
-        state = lifecycle.state(stage)
-        assert state.status == NOT_STARTED, stage
-        assert "not implemented yet" in state.detail, stage
+def test_all_lifecycle_stages_are_implemented():
+    """All stages in the lifecycle are currently implemented."""
+    assert set(LIFECYCLE_STAGES) == set(IMPLEMENTED_STAGES)
 
 
 @pytest.mark.parametrize(

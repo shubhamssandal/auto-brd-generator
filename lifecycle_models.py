@@ -69,6 +69,7 @@ IMPLEMENTED_STAGES = (
     PRD,
     ARCHITECTURE,
     IMPLEMENTATION_PLAN,
+    SPRINT_PLAN,
     TEST_CASES,
     TEST_EXECUTION,
     DELIVERY_STATUS,
@@ -416,6 +417,33 @@ def _sprint_completion_state(sprint_completion, sprint_completion_approved: bool
         return (IN_PROGRESS, status_detail)
 
 
+def _sprint_plan_state(sprint_plan, sprint_plan_approved: bool) -> tuple:
+    """
+    The sprint planning stage's ``(status, detail)``.
+
+    The gate is the *approved* implementation plan: creating a sprint against
+    an unapproved plan would create work nobody signed off. Approval is only
+    ever reported when the approval control sets it.
+    """
+    if sprint_plan is None:
+        return (
+            NOT_STARTED,
+            "Generate a sprint plan from the approved implementation plan.",
+        )
+
+    if not sprint_plan_approved:
+        return (
+            PENDING_REVIEW,
+            "Review the generated sprint plan and approve it below. "
+            "Nothing is executed until this plan is approved.",
+        )
+
+    return (
+        APPROVED,
+        "Sprint plan approved. The sprint execution stage is now available.",
+    )
+
+
 def lifecycle_from(
     brd: Optional[BRDData] = None,
     discovery_source: str = "",
@@ -431,6 +459,8 @@ def lifecycle_from(
     test_cases=None,
     test_cases_approved: bool = False,
     delivery_mapping=None,
+    sprint_plan=None,
+    sprint_plan_approved: bool = False,
     sprint_completion=None,
     sprint_completion_approved: bool = False,
 ) -> ProjectLifecycle:
@@ -515,10 +545,10 @@ def lifecycle_from(
         TEST_CASES,
         *_test_cases_state(test_cases if test_cases_ready else None, test_cases_approved and test_cases_ready),
     )
+    sprint_plan_ready = implementation_plan_approved and architecture_ready
     lifecycle.record(
         SPRINT_PLAN,
-        NOT_STARTED,
-        NOT_IMPLEMENTED_DETAIL
+        *_sprint_plan_state(sprint_plan if sprint_plan_ready else None, sprint_plan_approved and sprint_plan_ready)
     )
     lifecycle.record(
         TEST_EXECUTION,

@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 def _generate_test_cases_for_story(story: Story, client: Optional[genai.Client] = None) -> list[TestCase]:
     """Generate test cases for a single story."""
     if client is None:
-        client = genai.Client()
+        # No client provided, cannot generate test cases via AI.
+        return []
 
     prompt = (
         f"You are a QA engineer. Your task is to generate comprehensive test cases for the following user story:\n\n"
@@ -41,7 +42,7 @@ def _generate_test_cases_for_story(story: Story, client: Optional[genai.Client] 
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
