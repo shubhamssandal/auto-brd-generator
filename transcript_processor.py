@@ -135,6 +135,10 @@ def normalize_uploaded_file(
     # Read bytes - robust handling of previously-consumed streams
     if isinstance(file_obj, bytes):
         raw_bytes = file_obj
+    elif hasattr(file_obj, "getvalue"):
+        # For objects with getvalue() method (like BytesIO)
+        # getvalue() doesn't consume the stream, so no need to reset
+        raw_bytes = file_obj.getvalue()
     elif hasattr(file_obj, "read"):
         # For objects with a read() method (like Streamlit UploadedFile)
         # Store the current position if seek is available
@@ -155,10 +159,6 @@ def normalize_uploaded_file(
             # Fallback: if seek isn't available but we know current position,
             # we can't safely reset, but this is OK - the read() should work
             pass
-    elif hasattr(file_obj, "getvalue"):
-        # For objects with getvalue() method (like BytesIO)
-        raw_bytes = file_obj.getvalue()
-        # getvalue() doesn't consume the stream, so no need to reset
     else:
         raise TranscriptProcessingError(f"Unsupported file object type: {type(file_obj)}")
 

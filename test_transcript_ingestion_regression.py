@@ -130,25 +130,34 @@ def test_pdf_upload_normalization():
 
     # Verify we got a PDF - we're testing the real PDF extraction path
     assert transcript.metadata["extension"] == ".pdf"
-
-    # Verify we're testing the real normalize_uploaded_file path with real pypdf
     assert transcript.source == "upload"
 
+    # Verify the normalized transcript contains the actual PDF content
+    assert "Project: Alpha" in transcript.raw_text
+    assert "Enable dark mode" in transcript.raw_text
+    assert "secure auth" in transcript.raw_text
+
 def test_upload_stream_consumption():
-    """Test that normalize_uploaded_file properly handles consumed streams."""
+    """Test that normalize_uploaded_file properly handles consumed streams.
+
+    This reproduces the actual bug: simulate a preview/read that consumes the upload stream,
+    then call normalize_uploaded_file without manually resetting it.
+    """
     content = b"Meeting notes: build a payment API\nNeed secure auth."
     file_obj = io.BytesIO(content)
     file_obj.name = "transcript.txt"
 
-    # Consume the stream first
-    file_obj.read()
+    # Simulate a preview/read that consumes the stream
+    preview_content = file_obj.read()
 
-    # Reset the stream position
-    file_obj.seek(0)
-
-    # Now normalize - should handle the consumed stream properly
+    # Now normalize - should handle the consumed stream properly using production behavior
+    # We don't manually reset the stream to reproduce the actual bug
+    # This should succeed with the fixed implementation
     transcript = normalize_uploaded_file(file_obj)
+
+    # Verify the normalized transcript contains the actual content
     assert "Meeting notes" in transcript.raw_text
+    assert "secure auth" in transcript.raw_text
     assert transcript.metadata["filename"] == "transcript.txt"
     assert transcript.metadata["extension"] == ".txt"
 
